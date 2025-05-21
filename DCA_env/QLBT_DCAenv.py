@@ -4,13 +4,12 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
 import torch
 from MARL_DCA.env.qmix3 import QMIX, ReplayBufferRNN
 import torch.nn.functional as F
-import pandas as pd
-import csv
+import time
 
 if 'ipykernel' in sys.modules:
     from IPython import display
@@ -30,7 +29,7 @@ class AccessPoint:
         self.remaining_slots = 0          # Number of remaining slots for current transmission
         self.sif = self.SIF_DURATION
         self.delay = 0
-        # self.sif_mode = False
+        self.sif_mode = False
 
     def receive(self, nodes, packet_length):    
         ''' 
@@ -41,22 +40,26 @@ class AccessPoint:
         Returns:
             str: Channel state 
         '''
+        if self.channel_busy and self.remaining_slots == 0 and self.sif == 0:
+            print(f"[DEBUG] receive() | remaining_slots={self.remaining_slots}, sif={self.sif}, busy={self.channel_busy}")
+            self.sif_mode = False
+            self.channel_busy = False
+            return self.STATE_ACK
+        
         # busy channel
         if self.channel_busy:    
-            if len(nodes) > 0: 
-                self.reset()
-                return self.STATE_COLLISION
+            # if len(nodes) > 0: 
+            #     # self.reset()
+            #     # return self.STATE_COLLISION
+            #     return self.STATE_BUSY
             
             if self.remaining_slots > 0:
                 return self.STATE_BUSY
             
             if self.remaining_slots == 0 and self.sif > 0:
+                self.sif_mode = True
                 return self.STATE_BUSY
             
-            if self.remaining_slots == 0 and self.sif == 0:
-                print("[DEBUG] ACK 발생")
-                self.channel_busy = False
-                return self.STATE_ACK
         
         # idle channel
         if len(nodes) > 1:
@@ -78,11 +81,17 @@ class AccessPoint:
             
     def update(self): 
         """Decrement remaining slots or SIF"""
-        if self.channel_busy:     
-            if self.remaining_slots > 0:
-                self.remaining_slots -= 1 
-            elif self.remaining_slots == 0 and self.sif > 0: 
-                self.sif -= 1 
+        # if self.channel_busy:     
+        print(f"[DEBUG] update() | remaining_slots={self.remaining_slots}, sif={self.sif}")
+        #     if self.remaining_slots > 0:
+        #         self.remaining_slots -= 1
+            
+        #     if self.remaining_slots == 0 and self.sif > 0: 
+        #         self.sif -= 1 
+        if self.channel_busy and self.remaining_slots > 0:
+            self.remaining_slots -= 1 
+        if self.remaining_slots == 0 and self.sif > 0: 
+            self.sif -= 1 
 
     def reset(self):
         """Reset channel """
@@ -128,7 +137,8 @@ class QLBT_DCAEnv(gym.Env):
             "channel": "IDLE",
             "ready_nodes": [],
             "D2LT": [0] * self.num_agents, # 각 agent의 D2LT
-            "others": [0] * self.num_agents # 다른 사람의 데이터 전송 여부, 논문 상 O_t
+            "others": [0] * self.num_agents, # 다른 사람의 데이터 전송 여부, 논문 상 O_t
+            "successful": False
         }
 
         self._initialize_render_data()
@@ -143,6 +153,7 @@ class QLBT_DCAEnv(gym.Env):
         self.hidden_state = {
             "channel": "IDLE",
             "ready_nodes": [],
+            "successful": False,
             "D2LT": [0] * self.num_agents,
             "others": [0] * self.num_agents
         }
@@ -153,9 +164,14 @@ class QLBT_DCAEnv(gym.Env):
         return obs, infos
 
     def step(self, actions): 
+        # print(f"[DEBUG] step 시작 | t={self.t}, channel={self.hidden_state.get('channel', None)}")
+        # if self.hidden_state["channel"] == "ACK":
+        #     actions = {a: 0 for a in self.agents} # 모든 agent는 대기 상태로 전환
+        #     ready_nodes = []
+        # else: // 굳이 없어도 될듯
         action_array = np.array([actions[a] for a in self.agents])
         ready_nodes = np.where(action_array == 1)[0].tolist()
-
+    
         channel = self.access_point.receive(ready_nodes, self.packet_length)
         self.hidden_state["channel"] = channel
         self.hidden_state["ready_nodes"] = ready_nodes
@@ -164,6 +180,11 @@ class QLBT_DCAEnv(gym.Env):
             self.hidden_state["D2LT"][i] += 1
             self.hidden_state["others"][i] = int(actions[self.agents[i]] == 1)
 
+        # Update the ongoing packet transmission 
+        if channel in ["BUSY", "ACK"]: 
+            self.hidden_state["successful"] = True 
+        elif channel == "COLLISION": 
+            self.hidden_state["successful"] = False 
 
         rewards = self._compute_reward() 
         self.access_point.update() 
@@ -206,20 +227,18 @@ class QLBT_DCAEnv(gym.Env):
         return obs
     
     def _compute_reward(self):
+        # print("[DEBUG] _compute_reward() 호출됨")
         rewards = {a: 0.0 for a in self.agents}
         ready_nodes = self.hidden_state["ready_nodes"]
         channel = self.hidden_state["channel"]
         self.render_data["time_slot"] += 1
 
-        if channel == "ACK":
-            print("[DEBUG] ACK 수신, agent", winner)
+        if channel == "ACK" and self.hidden_state["successful"]:
             winner = self.access_point.current_transmitter
             self.render_data['success'] += 1
             self.render_data['agent_success'][winner] += 1
-            self.render_data['success_packet'] += self.packet_length + self.access_point.sif
-            print("[DEBUG] success_packet =", self.render_data['success_packet'])
-
-            self.render_data['agent_success_packet'][winner] += self.packet_length + self.access_point.sif
+            self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
+            self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
             
             for i, a in enumerate(self.agents):
                 rewards[a] = 1.0 - (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
@@ -237,14 +256,14 @@ class QLBT_DCAEnv(gym.Env):
     
     def _initialize_render_data(self):
         self.render_data = {
-            "time_agent": np.zeros((self.num_agents, self.RENDER_SLOTS)),
-            "agent_success": np.zeros((self.num_agents, 1), dtype=int),
-            "agent_collision": np.zeros((self.num_agents, 1), dtype=int),
-            "agent_success_packet": np.zeros((self.num_agents, 1), dtype=int),
+            "time_agent": np.zeros((self.num_agents, self.RENDER_SLOTS)), # [3, 200]
+            "agent_success": np.zeros((self.num_agents, 1), dtype=int),   # [3, 1]
+            "agent_collision": np.zeros((self.num_agents, 1), dtype=int), # [3, 1]
+            "agent_success_packet": np.zeros((self.num_agents, 1), dtype=int), # [3, 1]
             "time_slot": 0,
-            "success": 0,
-            "success_packet": 0,
-            "collision": 0,
+            "success": 0,           # 성공 횟수
+            "success_packet": 0,    # 전송 성공한 패킷 수
+            "collision": 0,         # 충돌 횟수
             "cumsum_success": [],
             "cumsum_success_packet": [],
             "cumsum_collision": [],
@@ -265,8 +284,11 @@ class QLBT_DCAEnv(gym.Env):
             for node in ready_nodes:
                 self.state_data[node] = 2
         elif channel == "BUSY":
-            if self.access_point.remaining_slots > 0:
+            if self.access_point.remaining_slots > 0 and not self.access_point.sif_mode:
                 self.state_data[self.access_point.current_transmitter] = 1
+            elif self.access_point.remaining_slots > 0 and len(ready_nodes) > 0: 
+                for node in ready_nodes: 
+                    self.state_data[node] = 2 
         
         self.render_data['time_agent'] = np.concatenate((self.render_data['time_agent'][:,1:], self.state_data), axis=1)
         self.render_data['delay'].append(np.mean(self.hidden_state["D2LT"]))
@@ -276,7 +298,7 @@ class QLBT_DCAEnv(gym.Env):
             self.render_data["cumsum_success"].append(self.render_data["success"])
             self.render_data["cumsum_success_packet"].append(self.render_data["success_packet"])
             self.render_data["cumsum_collision"].append(self.render_data["collision"])
-            self.render_data["throughput"].append(self.render_data["success"] / self.t)
+            self.render_data["throughput"].append(self.render_data["success"] / t_safe)
             self.render_data["throughput_packet"].append(self.render_data["success_packet"] / t_safe)        
 
         
@@ -291,19 +313,28 @@ class QLBT_DCAEnv(gym.Env):
         elif self.render_mode in ["rgb_array", "human"]:
             self._render_human(data)
     
-    def _render_ansi(self, time_node_data):
-        if self.NOTEBOOK:
-            display.clear_output(wait=True)
-        print(f"\n{'='*40} QLBT Rendering (t={self.t}) {'='*40}")
+    def _render_ansi(self, time_node_data): 
+        """Render the environment in ANSI mode""" 
+        if self.NOTEBOOK: 
+            display.clear_output(wait=True)  
+        print("*" * 35 + f"{'RENDERING DCA(t = ' + str(self.t) + ')':^40}" + "*" * 35)
         for i, row in enumerate(time_node_data):
-            d2lt = self.hidden_state['D2LT'][i]
-            print(f"Node {i:2d} (D2LT={d2lt:3d}): ", end='')
-            for col in row:
-                color = '\033[44m' if col == 1 else '\033[101m' if col == 2 else '\033[42m' if col == 3 else '\033[0m'
-                print(f"{color}{int(col)}\033[0m", end=' ')
+            print(f"Node {i+1} (D2LT={self.hidden_state['D2LT'][i]:>3d}): ", end=' ')
+            for rc in row:
+                CCOLOR = '\033[44m' if rc == 1 else '\033[101m' if rc == 2 else '\033[42m' if rc == 3 else '\33[7m'
+                CEND = '\33[0m'
+                print(f"{CCOLOR}{int(rc)}{CEND}", end=' ')
             print()
-        print(f"Throughput: {self.render_data['success_packet'] / self.t if self.t > 0 else 0:.3f}")
+        print(f"Time Slot: {self.t}, "
+                f"Success: {self.render_data['success']}, "
+                f"Collision: {self.render_data['collision']}, "
+                f"Throughput: {self.render_data['success_packet'] / self.t if self.t > 0 else 0:.3f}, " 
+                # f"Mean Delay: {self.render_data['delay'][-1]}"
+                f"Mean Delay: {np.mean(self.hidden_state['D2LT'])}"
+                )
+        print("*" * 110)
         print()
+        time.sleep(0.1)
 
     def _render_human(self, time_node_data):
         plt.clf()
@@ -311,15 +342,15 @@ class QLBT_DCAEnv(gym.Env):
         norm = colors.BoundaryNorm([0, 1, 2, 3, 4], cmap.N)
 
         plt.subplot(311)
-        plt.title(f"QLBT DCA (t = {self.t}, throughput: {self.render_data['success_packet'] / self.t:.3f})")
+        plt.title(f"QLBT DCA (t = {self.t}, throughput: {self.render_data['success_packet'] / self.render_data['time_slot']:.3f})")
         plt.imshow(time_node_data, cmap=cmap, norm=norm, aspect='auto')
         plt.ylabel("Agent ID")
 
         plt.subplot(323)
-        plt.plot(self.render_data["cumsum_success_packet"], label="Success")
-        plt.plot(self.render_data["cumsum_collision"], label="Collision")
+        plt.plot(self.render_data["cumsum_success_packet"], 'b-', label="Success")
+        plt.plot(self.render_data["cumsum_collision"], 'r-', label="Collision")
         plt.legend()
-        plt.grid()
+        plt.grid(True)
 
         plt.subplot(324)
         plt.bar(range(self.num_agents), self.render_data["agent_success_packet"].squeeze())
@@ -327,9 +358,9 @@ class QLBT_DCAEnv(gym.Env):
  
 
         plt.subplot(313)
-        plt.plot(self.render_data["throughput_packet"], label="Throughput")
+        plt.plot(self.render_data["throughput_packet"], 'b-', label="Throughput Packet")
         plt.legend()
-        plt.grid()
+        plt.grid(True)
 
         if self.NOTEBOOK:
             display.clear_output(wait=True)
@@ -362,12 +393,6 @@ class QLBT_DCAEnv(gym.Env):
             else:
                 print(f"[WARN] Skipped {key} for episode {episode}: length = {len(values)}")
 
-    
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
 
 def obs_dict_to_vec(obs_dict):
     return np.concatenate((
@@ -384,10 +409,8 @@ if __name__ == "__main__":
     action_dim = 2      # 0: wait, 1: transmit
     max_episodes = 1000
     max_cycles = 200
-    packet_length = 3
+    packet_length = 10
     render_mode = "human"
-    seed = 42
-    set_seed(seed)
 
     env = QLBT_DCAEnv(
         num_agents = num_agents,
@@ -427,13 +450,13 @@ if __name__ == "__main__":
 
             obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
             
-            # env.render()
+            env.render()
             next_obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
 
             joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim()==2 else obs[agent] for agent in env.agents])
             joint_next_obs = torch.stack([next_obs[agent].squeeze(0) if next_obs[agent].dim()==2 else next_obs[agent] for agent in env.agents])
             joint_actions = torch.tensor([actions[agent] for agent in env.agents], dtype=torch.long)
-            joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1)
+            joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1) # q_tot
             joint_dones = torch.tensor([terminations[agent] for agent in env.agents]).unsqueeze(-1)
             joint_hidden = torch.stack([h_states[agent].detach() for agent in env.agents])
 
@@ -470,31 +493,6 @@ if __name__ == "__main__":
     if not env.NOTEBOOK:
         plt.show()
 
-# if __name__ == "__main__":
-
-#     num_agents = 3
-#     hidden_dim = 128    # QMIX agent GRU hidden 크기
-#     action_dim = 2      # 0: wait, 1: transmit
-#     max_episodes = 1000
-#     max_cycles = 200
-#     packet_length = 3
-#     render_mode = "human"
-#     seed = 42
-#     set_seed(seed)
-
-#     env = QLBT_DCAEnv(
-#         num_agents = num_agents,
-#         max_cycles = max_cycles,
-#         packet_length = packet_length,
-#         render_mode = render_mode
-#     )
-
-#     trainer = QMIX(env=env, hidden_dims=hidden_dim, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-#         epochs=10, max_steps=max_cycles, log_dir="logs/qmix_dca_logs", plot_window=100,
-#         update_interval=100, device="cpu", tau=0.01
-#     )
-
-#     trainer.buffer = ReplayBufferRNN(capacity=10000, device="cpu")
 
 #     def evaluate_qmix(env, trainer, episodes=5, episode_index=None):
 #         total_reward = 0
@@ -537,75 +535,7 @@ if __name__ == "__main__":
 #         avg_reward = total_reward / episodes
 #         print(f"[EVAL] Average reward over {episodes} episodes: {avg_reward:.2f}")
 
-#         # Save log
-#         if episode_index is not None:
-#             os.makedirs("logs/eval", exist_ok=True)
-#             csv_path = f"logs/eval/eval_ep{episode_index}.csv"
-#             with open(csv_path, "w", newline='') as f:
-#                 writer = csv.writer(f)
-#                 writer.writerow(["Episode", "Reward"])
-#                 for i, r in enumerate(eval_log):
-#                     writer.writerow([i + 1, r])
-#                 writer.writerow(["Average", avg_reward])
 
-#     plt.ioff()  # Turn off interactive plotting
-
-#     for episode in range(max_episodes):
-#         obs_dict, _ = env.reset()
-#         obs = {agent: trainer.preprocess_observation(obs_dict[agent], agent) for agent in env.agents}
-
-#         h_states = {agent: torch.zeros(hidden_dim) for agent in env.agents}
-#         last_actions = {agent: torch.zeros(action_dim) for agent in env.agents}
-
-#         episode_data = []
-
-#         for _ in range(max_cycles):
-#             actions, h_next = {}, {}
-#             for agent in env.agents:
-#                 action, h_new = trainer.select_action(
-#                     agent=agent,
-#                     obs=obs[agent],
-#                     last_action=last_actions[agent],
-#                     his_in=h_states[agent]
-#                 )
-#                 actions[agent] = action
-#                 h_next[agent] = h_new.detach()
-
-#             obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
-#             next_obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
-
-#             joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim()==2 else obs[agent] for agent in env.agents])
-#             joint_next_obs = torch.stack([next_obs[agent].squeeze(0) if next_obs[agent].dim()==2 else next_obs[agent] for agent in env.agents])
-#             joint_actions = torch.tensor([actions[agent] for agent in env.agents], dtype=torch.long)
-#             joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1)
-#             joint_dones = torch.tensor([terminations[agent] for agent in env.agents]).unsqueeze(-1)
-#             joint_hidden = torch.stack([h_states[agent].detach() for agent in env.agents])
-
-#             episode_data.append((joint_hidden, joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
-
-#             obs = next_obs
-#             h_states = h_next
-#             last_actions = {
-#                 agent: F.one_hot(torch.tensor(actions[agent]), num_classes=action_dim).float() for agent in env.agents
-#             }
-
-#             env.render()
-
-#             if all(terminations.values()) or all(truncations.values()):
-#                 break
-
-#         h_seq, s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
-#         hidden_seq = torch.stack(h_seq)
-#         assert hidden_seq.shape[-2:] == (num_agents, hidden_dim), f"Unexpected hidden_seq shape: {hidden_seq.shape}"
-
-#         trainer.buffer.push(
-#             hidden_seq=hidden_seq,
-#             state_seq=torch.stack(s_seq),
-#             action_seq=torch.stack(a_seq),
-#             reward_seq=torch.stack(r_seq),
-#             next_state_seq=torch.stack(ns_seq),
-#             dones=torch.stack(d_seq)
-#         )
 
 #         trainer.train()
 #         print(f"Episode {episode + 1}/{max_episodes} finished. Total reward: {sum([r.item() for r in r_seq]):.3f}, Steps: {len(r_seq)}")
