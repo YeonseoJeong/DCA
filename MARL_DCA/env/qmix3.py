@@ -9,7 +9,7 @@ from collections import deque
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
 from pettingzoo.utils.conversions import aec_to_parallel
-from .logger import Logger
+from logger import Logger
 
 '''
 QMIX
@@ -178,7 +178,8 @@ class QMIX(nn.Module):
                 clip_grad = None,
                 update_interval=100, 
                 device="cpu",
-                tau=None
+                tau=None,
+                decay_ratio = 0.99
                 ):
         super(QMIX, self).__init__()
         
@@ -236,7 +237,7 @@ class QMIX(nn.Module):
         self.clip_grad = clip_grad
         self.epsilon_start = 1.0
         self.epsilon_end = 0.05
-        self.decay_ratio = 0.995
+        self.decay_ratio = decay_ratio
         self.step = 0
         self.tau = tau
 
@@ -318,7 +319,7 @@ class QMIX(nn.Module):
         return action, h_out #, q_selected
 
         
-    def update(self):
+    def update(self, alpha=0.1):
         ### 2. graph -> episode 0부터
         if len(self.buffer) < self.batch_size:
             return 0.0
@@ -373,7 +374,16 @@ class QMIX(nn.Module):
         y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=0.8)
 
         # loss and optimization
-        loss = F.mse_loss(q_total, y_total.detach())
+        loss_qmix = F.mse_loss(q_total, y_total.detach())
+        
+        loss_ind = 0.0
+        for i in range(self.n_agents):
+            agent_q = agent_qs[:, :, i]
+            target_q = target_qs[:, :, i]
+            loss_ind += F.mse_loss(agent_q, target_q.detach())
+        loss_ind /= self.n_agents
+
+        loss = loss_qmix + alpha * loss_ind
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
@@ -389,14 +399,14 @@ class QMIX(nn.Module):
         avg_q_total = q_total.detach().mean().item()        # q_total.shape: (B, T)
 
         # per_agent_rewards = reward.mean(dim=1).squeeze(-1).mean(dim=0)  # [N]
-        per_agent_losses = agent_qs.detach() - target_qs.detach()  # [B, T, N]
-        per_agent_losses = (per_agent_losses ** 2).mean(dim=(0, 1))  # [N]
+        td_errors = (agent_qs - target_qs.detach()) ** 2  # [B, T, N]
+        per_agent_losses = td_errors.mean(dim=(0, 1))  # [N]
 
         ### 1. Q individual
         metrics = {
             'avg_loss': loss.item(),
-            'avg_reward': r_total.sum().item() / (B*N),
-            'avg_q_total': q_total.detach().mean().item(),
+            'avg_reward': r_total.mean().item(), # r_total.shape: (B, T)
+            'avg_q_total': avg_q_total,
             'avg_entropy': self.epsilon_decay(),
             'per_agent_qs': {agent: per_agent_qs[i].item() for i, agent in enumerate(self.agents)},
             'per_agent_losses': {agent: per_agent_losses[i].item() for i, agent in enumerate(self.agents)}
@@ -420,7 +430,7 @@ class QMIX(nn.Module):
         last_actions = {agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device) for agent in self.agents}
 
         for _ in range(self.max_steps):
-            actions, h_next, q_selected_dict = {}, {}, {}
+            actions, h_next = {}, {}
             for agent in self.agents:
                 action, h_new = self.select_action(agent, obs[agent], last_actions[agent], h_states[agent])
                 #print(f"[DEBUG] obs.shape = {obs[agent].shape}, last_actions.shape = {last_actions[agent].shape}, h_states.shape = {h_states[agent].shape}")
@@ -463,10 +473,10 @@ class QMIX(nn.Module):
         )
 
 
-    def train(self, max_episode =1000, log_interval = 1):
+    def train(self, max_episode, log_interval = 1):
         for episode in range(max_episode):
             self.rollout_episode() # returns: {agent_0: [q0, q1, ..., qT], ...}
-            metrics = self.update()
+            metrics = self.update(alpha=0.1) # returns: {avg_loss, avg_reward, avg_q_total, per_agent_qs, per_agent_losses}
 
             if not metrics:
                 continue
@@ -492,9 +502,9 @@ class QMIX(nn.Module):
                 print(f"[ERROR] save_render_data failed at episode {episode}: {e}")
 
             if episode % log_interval == 0:
-                self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f}") #| Avg Entropy: {metrics['avg_entropy']:.4f}
-                
-        self.logger.close()
+                self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}") 
+        self.logger.close()    
+        
 
 
     def save(self, path):
@@ -527,19 +537,19 @@ class QMIX(nn.Module):
 
 
 
-if __name__ == '__main__':
-    env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 200, continuous_actions=False)
-    if hasattr(env, "aec_env"):
-        for agent in env.aec_env.unwrapped.world.agents:
-            agent.size = 0.02
-    else:
-        pass
-    # env = aec_to_parallel(env)
-    hidden_dims = 128
+# if __name__ == '__main__':
+#     env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 200, continuous_actions=False)
+#     if hasattr(env, "aec_env"):
+#         for agent in env.aec_env.unwrapped.world.agents:
+#             agent.size = 0.02
+#     else:
+#         pass
+#     # env = aec_to_parallel(env)
+#     hidden_dims = 128
 
-    qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-                epochs=10, max_steps=200, log_dir="logs/qmix_simple_spread_logs", plot_window=100,
-                update_interval=100, device="cpu", tau=0.01)
+#     qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
+#                 epochs=10, max_steps=200, log_dir="logs/qmix_simple_spread_logs", plot_window=100,
+#                 update_interval=100, device="cpu", tau=0.01)
 
-    qmix.train(max_episode=1000, log_interval=1)
+#     qmix.train(max_episode=1000, log_interval=1)
     

@@ -41,7 +41,7 @@ class AccessPoint:
             str: Channel state 
         '''
         if self.channel_busy and self.remaining_slots == 0 and self.sif == 0:
-            print(f"[DEBUG] receive() | remaining_slots={self.remaining_slots}, sif={self.sif}, busy={self.channel_busy}")
+            # print(f"[DEBUG] receive() | remaining_slots={self.remaining_slots}, sif={self.sif}, busy={self.channel_busy}")
             self.sif_mode = False
             self.channel_busy = False
             return self.STATE_ACK
@@ -82,7 +82,7 @@ class AccessPoint:
     def update(self): 
         """Decrement remaining slots or SIF"""
         # if self.channel_busy:     
-        print(f"[DEBUG] update() | remaining_slots={self.remaining_slots}, sif={self.sif}")
+        # # print(f"[DEBUG] update() | remaining_slots={self.remaining_slots}, sif={self.sif}")
         #     if self.remaining_slots > 0:
         #         self.remaining_slots -= 1
             
@@ -168,7 +168,7 @@ class QLBT_DCAEnv(gym.Env):
         # if self.hidden_state["channel"] == "ACK":
         #     actions = {a: 0 for a in self.agents} # 모든 agent는 대기 상태로 전환
         #     ready_nodes = []
-        # else: // 굳이 없어도 될듯
+        # else: 
         action_array = np.array([actions[a] for a in self.agents])
         ready_nodes = np.where(action_array == 1)[0].tolist()
     
@@ -231,18 +231,26 @@ class QLBT_DCAEnv(gym.Env):
         rewards = {a: 0.0 for a in self.agents}
         ready_nodes = self.hidden_state["ready_nodes"]
         channel = self.hidden_state["channel"]
+        d2lt = self.hidden_state["D2LT"]
         self.render_data["time_slot"] += 1
 
-        if channel == "ACK" and self.hidden_state["successful"]:
-            winner = self.access_point.current_transmitter
+        if channel == "ACK":
+            winner = self.access_point.current_transmitter # idx
             self.render_data['success'] += 1
             self.render_data['agent_success'][winner] += 1
             self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
             self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
-            
+
+            max_d2lt_agent_idx = np.argmax(d2lt)
+
             for i, a in enumerate(self.agents):
-                rewards[a] = 1.0 - (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
-            
+                # rewards[a] = (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
+                if i == winner:
+                    if i == max_d2lt_agent_idx:
+                        rewards[a] = 1.0
+                    else:
+                        rewards[a] = 1.0 * (d2lt[i] / sum(d2lt) + 1e-6)
+                
             self.hidden_state["D2LT"][winner] = 0
             self.hidden_state["others"][winner] = 0
         
@@ -294,12 +302,12 @@ class QLBT_DCAEnv(gym.Env):
         self.render_data['delay'].append(np.mean(self.hidden_state["D2LT"]))
 
         if self.render_mode in ["human", "rgb_array"]:
-            t_safe = max(self.t, 1)
+            # t_safe = max(self.t, 1)
             self.render_data["cumsum_success"].append(self.render_data["success"])
             self.render_data["cumsum_success_packet"].append(self.render_data["success_packet"])
             self.render_data["cumsum_collision"].append(self.render_data["collision"])
-            self.render_data["throughput"].append(self.render_data["success"] / t_safe)
-            self.render_data["throughput_packet"].append(self.render_data["success_packet"] / t_safe)        
+            self.render_data["throughput"].append(self.render_data["success"] / self.render_data["time_slot"])
+            self.render_data["throughput_packet"].append(self.render_data["success_packet"] / self.render_data["time_slot"])        
 
         
     def render(self):
@@ -408,9 +416,9 @@ if __name__ == "__main__":
     hidden_dim = 128    # QMIX agent GRU hidden 크기
     action_dim = 2      # 0: wait, 1: transmit
     max_episodes = 1000
-    max_cycles = 200
+    max_cycles = 500
     packet_length = 10
-    render_mode = "human"
+    render_mode = "rgb_array"
 
     env = QLBT_DCAEnv(
         num_agents = num_agents,
@@ -422,73 +430,71 @@ if __name__ == "__main__":
 
     trainer = QMIX(env=env, hidden_dims=hidden_dim, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
         epochs=10, max_steps=max_cycles, log_dir="logs/qmix_dca_logs", plot_window=100,
-        update_interval=100, device="cpu", tau=0.01
+        update_interval=100, device="cpu", tau=0.01, decay_ratio = 0.99
     )
 
     trainer.buffer = ReplayBufferRNN(capacity=10000, device="cpu")
 
-    for episode in range(max_episodes):
-        obs_dict, _ = env.reset()
-        obs = {agent: trainer.preprocess_observation(obs_dict[agent], agent) for agent in env.agents}
+    # for episode in range(max_episodes):
+    #     obs_dict, _ = env.reset()
+    #     obs = {agent: trainer.preprocess_observation(obs_dict[agent], agent) for agent in env.agents}
 
-        h_states = {agent: torch.zeros(hidden_dim) for agent in env.agents}
-        last_actions = {agent: torch.zeros(action_dim) for agent in env.agents}
+    #     h_states = {agent: torch.zeros(hidden_dim) for agent in env.agents}
+    #     last_actions = {agent: torch.zeros(action_dim) for agent in env.agents}
 
-        episode_data = []
+    #     episode_data = []
 
-        for _ in range(max_cycles):
-            actions, h_next = {}, {}
-            for agent in env.agents:
-                action, h_new = trainer.select_action(
-                    agent=agent,
-                    obs=obs[agent],
-                    last_action=last_actions[agent],
-                    his_in=h_states[agent]
-                )
-                actions[agent] = action
-                h_next[agent] = h_new.detach()
+    #     for _ in range(max_cycles):
+    #         actions, h_next = {}, {}
+    #         for agent in env.agents:
+    #             action, h_new = trainer.select_action(
+    #                 agent=agent,
+    #                 obs=obs[agent],
+    #                 last_action=last_actions[agent],
+    #                 his_in=h_states[agent]
+    #             )
+    #             actions[agent] = action
+    #             h_next[agent] = h_new.detach()
 
-            obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
+    #         obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
             
-            env.render()
-            next_obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
+    #         # env.render()
+    #         next_obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
 
-            joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim()==2 else obs[agent] for agent in env.agents])
-            joint_next_obs = torch.stack([next_obs[agent].squeeze(0) if next_obs[agent].dim()==2 else next_obs[agent] for agent in env.agents])
-            joint_actions = torch.tensor([actions[agent] for agent in env.agents], dtype=torch.long)
-            joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1) # q_tot
-            joint_dones = torch.tensor([terminations[agent] for agent in env.agents]).unsqueeze(-1)
-            joint_hidden = torch.stack([h_states[agent].detach() for agent in env.agents])
+    #         joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim()==2 else obs[agent] for agent in env.agents])
+    #         joint_next_obs = torch.stack([next_obs[agent].squeeze(0) if next_obs[agent].dim()==2 else next_obs[agent] for agent in env.agents])
+    #         joint_actions = torch.tensor([actions[agent] for agent in env.agents], dtype=torch.long)
+    #         joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1) # q_tot
+    #         joint_dones = torch.tensor([terminations[agent] for agent in env.agents]).unsqueeze(-1)
+    #         joint_hidden = torch.stack([h_states[agent].detach() for agent in env.agents])
 
-            episode_data.append((joint_hidden, joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
+    #         episode_data.append((joint_hidden, joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
 
-            obs = next_obs
-            h_states = h_next
-            last_actions = {
-                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=action_dim).float() for agent in env.agents
-            }
+    #         obs = next_obs
+    #         h_states = h_next
+    #         last_actions = {
+    #             agent: F.one_hot(torch.tensor(actions[agent]), num_classes=action_dim).float() for agent in env.agents
+    #         }
 
             
 
-            if all(terminations.values()) or all(truncations.values()):
-                break
+    #         if all(terminations.values()) or all(truncations.values()):
+    #             break
 
-        h_seq, s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
-        hidden_seq = torch.stack(h_seq)  # (T, N, H)
-        assert hidden_seq.shape[-2:] == (num_agents, hidden_dim), f"Unexpected hidden_seq shape: {hidden_seq.shape}"
+    #     h_seq, s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
+    #     hidden_seq = torch.stack(h_seq)  # (T, N, H)
+    #     assert hidden_seq.shape[-2:] == (num_agents, hidden_dim), f"Unexpected hidden_seq shape: {hidden_seq.shape}"
 
-        trainer.buffer.push(
-            hidden_seq=hidden_seq,
-            state_seq=torch.stack(s_seq),
-            action_seq=torch.stack(a_seq),
-            reward_seq=torch.stack(r_seq),
-            next_state_seq=torch.stack(ns_seq),
-            dones=torch.stack(d_seq)
-        )
+    #     trainer.buffer.push(
+    #         hidden_seq=hidden_seq,
+    #         state_seq=torch.stack(s_seq),
+    #         action_seq=torch.stack(a_seq),
+    #         reward_seq=torch.stack(r_seq),
+    #         next_state_seq=torch.stack(ns_seq),
+    #         dones=torch.stack(d_seq)
+    #     )
 
-        trainer.train()
-        print(f"Episode {episode + 1}/{max_episodes} finished. Total reward: {sum([r.item() for r in r_seq]):.3f}, Steps: {len(r_seq)}")
-        env.save_render_data(save_dir="logs/render_data", episode=episode)
+    trainer.train(max_episode=max_episodes)
 
     if not env.NOTEBOOK:
         plt.show()
