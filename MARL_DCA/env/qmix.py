@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import random
+from collections import deque
 
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
@@ -18,19 +19,29 @@ Qtot(τ, u, s; θ) = f(Q1(τ1, u1, s; θ), Q2(τ2, u2, s; θ), ..., Qn(τn, un, 
 f: mixing network
 '''
 
+# 1. hidden_seq -> buffer에 넣을 필요 x
+# 2. seq단위로 history를 저장하고, agent별로 hidden state를 유지
+# 3. gru로 했는데 hidden_state업데이트하는 방식에서 gru cell과 차이가 있는 것 같음
+
 class AgentNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_dim=64):
         super(AgentNetwork, self).__init__()
+
+        self.hidden_dim = hidden_dim
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first = True) # (맨 앞에 batch 차원)
         self.q_out = nn.Linear(hidden_dim, action_dim)
 
-    def forward(self, obs, last_action, his_in):
-        x = torch.cat([obs, last_action], dim=-1)
-        x = F.relu(self.fc1(x))
-        his_out = self.gru(x, his_in) # f.relu() 할지 말지 
-        q = self.q_out(his_out)
-        return q, his_out # q = action_dim만큼 (q1, q2, ... , qn) + his_out
+    def forward(self, obs_seq, act_seq, h_0 = None):
+        x = torch.cat([obs_seq, act_seq], dim=-1) # (B, T, obs+act)
+        x = F.relu(self.fc1(x)) # (B, T, H)
+        if h_0 is None:
+            h_0 = torch.zeros(1, x.size(0), self.hidden_dim, device=x.device)
+ 
+        out_seq, h_n = self.gru(x, h_0) # out_seq: (B, T, H)
+        q_seq = self.q_out(out_seq)  # (B, T, act_dim)
+
+        return q_seq, h_n.squeeze(0) # h_n: (1, B, H) → (B, H)
 
 
 class HyperNetwork(nn.Module):
@@ -62,138 +73,169 @@ class MixingNetwork(nn.Module):
             nn.Linear(hidden_dim, 1) # Q_tot
         )
 
-    def forward(self, agents_q, state): # agents_q : [q1, q2, ... , qn], state
-        bs = agents_q.size(0) #agents_q = [bs, n_agents]
+    def forward(self, agents_q, state): 
+        # agents_q : [q1, q2, ... , qn]             (B, N)
+        # state : [state_dim] = obs_dim * n_agents  (B, state_dim)
+        B = agents_q.size(0)
+        # print(f"[DEBUG] agents_q.shape = {agents_q.shape}, state.shape = {state.shape}") 64,3 / 64,21
+
+        w1 = self.hyper_w1(state).view(B, self.n_agents, self.hidden_dim)  # W1 = (B, N, H)
+        b1 = self.hyper_b1(state).view(B, 1, self.hidden_dim)              # b1 = (B, 1, H)
+        
+        hidden = F.elu(torch.bmm(agents_q.unsqueeze(1), w1) + b1)          # → (B, 1, H)       
+
+        w2 = self.hyper_w2(state).view(B, self.hidden_dim, 1)              # W2 = (B, H, 1)
+        b2 = self.hyper_b2(state)                                           # b2 = (B, 1)
+
+        q_total = torch.bmm(hidden, w2).squeeze(1) + b2
+        return q_total.squeeze(-1)      # [1]
     
-        w1 = self.hyper_w1(state).view(bs, self.n_agents, self.hidden_dim)  # W1 = [bs, n_agents, hidden_dim]
-        b1 = self.hyper_b1(state).view(bs, 1, self.hidden_dim)              # b1 = [bs, 1, hidden_dim]
-        hidden = F.elu(torch.bmm(agents_q.unsqueeze(1), w1) + b1).squeeze(1)             
-        # hidden = [bs, 1, n_agents] * [bs, n_agents, hidden_dim] + [bs, 1, hidden_dim]
-        # hidden = [bs, hidden_dim]
 
-        w2 = self.hyper_w2(state).view(bs, self.hidden_dim, 1)              # W2 = [bs, hidden_dim, 1]
-        b2 = self.hyper_b2(state)                                           # b2 = [bs, 1]
+class ReplayBufferRNN: 
+    """
+    Replay buffer for RNN-based agents in QMIX (GRUCell 기반).
+    Stores full trajectories per episode, and returns fixed-length sequences during training.
+    """
+    def __init__(self, capacity=10000, device="cpu"):
+        self.buffer = deque(maxlen=capacity)
+        self.device = device
 
-        q_total = torch.bmm(hidden.unsqueeze(1), w2).squeeze(1) + b2
-        # q_total = [bs, hidden_dim] * [bs, hidden_dim, 1] + [bs, 1]
-        # q_total = [bs, 1]
-        return q_total
-    
+    def push(self, state_seq, action_seq, reward_seq, next_state_seq, done_seq):
+        '''
+        Stores one full episode
+        - state_seq: (T, N, obs_dim)
+        - action_seq: (T, N)
+        - reward_seq: (T, N)
+        - next_state_seq: (T, N, obs_dim)
+        - done_seq: (T, N)
+        '''
+        if len(self.buffer) == self.buffer.maxlen:
+            self.buffer.popleft()
+        data = (
+            state_seq.detach(), 
+            action_seq.detach(), 
+            reward_seq.detach(), 
+            next_state_seq.detach(), 
+            done_seq.detach()
+        )
+        self.buffer.append(data)
 
-class ReplayBufferRNN:
-    def __init__(self, capacity=10000):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
-        self.device = torch.device("cpu")
+    def sample(self, batch_size, seq_len):
+        """
+        Samples fixed-length subsequences from stored full episodes.
+        Returns:
+            - state:      (B, seq_len, N, obs_dim)
+            - action:     (B, seq_len, N)
+            - reward:     (B, seq_len, N)
+            - next_state: (B, seq_len, N, obs_dim)
+            - done:       (B, seq_len, N)
+        """
+        state_batch = []
+        action_batch = []
+        reward_batch = []
+        next_state_batch = []
+        done_batch = []
 
-    def push(self, hidden_seq, state_seq, action_seq, reward_seq, next_state_seq, dones):
-        data = tuple(tensor.detach().cpu().clone() for tensor in (
-            hidden_seq, state_seq, action_seq, reward_seq, next_state_seq, dones
-        ))
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = data
-        self.position = (self.position + 1) % self.capacity
+        for _ in range(batch_size):
+            # 에피소드 하나 랜덤 선택
+            state_seq, action_seq, reward_seq, next_state_seq, done_seq = random.choice(self.buffer)
+            T = state_seq.size(0)  # T: sequence length of the episode
+            if T< seq_len:
+                continue    # seq_len보다 짧은 에피소드는 제외
+            
+            start_idx = random.randint(0, T - seq_len)  # 랜덤 시작 인덱스
+            end_idx = start_idx + seq_len
 
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        h_lst, s_lst, a_lst, r_lst, ns_lst, dn_lst = zip(*batch)
-        # hi_tensor = torch.cat(hi_lst, dim=1).detach()
-        # ho_tensor = torch.cat(ho_lst, dim=1).detach()
-        # 텐서 스택 후 지정 디바이스로 이동
-        h_tensor = torch.stack(h_lst).to(self.device)     # (B, T+1, N, H)
-        s_tensor = torch.stack(s_lst).to(self.device)     # (B, T, N, obs)
-        a_tensor = torch.stack(a_lst).to(self.device)     # (B, T, N)
-        r_tensor = torch.stack(r_lst).to(self.device)     # (B, T, N)
-        ns_tensor = torch.stack(ns_lst).to(self.device)   # (B, T, N, obs)
-        d_tensor = torch.stack(dn_lst).to(self.device)    # (B, T, N)
+            state_batch.append(state_seq[start_idx:end_idx])      # (seq_len, N, obs_dim)
+            action_batch.append(action_seq[start_idx:end_idx])    # (seq_len, N)
+            reward_batch.append(reward_seq[start_idx:end_idx])    # (seq_len, N)
+            next_state_batch.append(next_state_seq[start_idx:end_idx])  # (seq_len, N, obs_dim)
+            done_batch.append(done_seq[start_idx:end_idx])        # (seq_len, N)
 
-        # 정수형 보정 (action)
-        a_tensor = a_tensor.long()
-        return h_tensor, s_tensor, a_tensor, r_tensor, ns_tensor, d_tensor
+        # shape: (B, seq_len, N, ...)
+        s_tensor = torch.stack(state_batch).to(self.device)     # (B, T, N, obs_dim)
+        a_tensor = torch.stack(action_batch).long().to(self.device)      # action.shape = (B, T, N) -> (B, T, N, 1)
+        r_tensor = torch.stack(reward_batch).to(self.device)             # reward.shape = (B, T) -> (B, T, 1), q_tot
+        ns_tensor = torch.stack(next_state_batch).to(self.device)   # (B, T, N, obs_dim)
+        d_tensor = torch.stack(done_batch).to(self.device)            # dones.shape = (B, T, N) -> (B, T, N, 1)
+
+        return s_tensor, a_tensor, r_tensor, ns_tensor, d_tensor
 
     def __len__(self):
         return len(self.buffer)
 
+def td_lambda_target(rewards, target_qs, gamma=0.99, td_lambda=0.8):
+    """
+    Compute TD(λ) targets.
+    Inputs:
+        rewards:    (B, T) or (B, T, 1)
+        target_qs:  (B, T) or (B, T, 1)
+    Returns:
+        targets:    (B, T)
+    """
+    if rewards.dim() == 3:
+        rewards = rewards.squeeze(-1)
+    if target_qs.dim() == 3:
+        target_qs = target_qs.squeeze(-1)
 
-def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=0.8):
     B, T = rewards.shape
-    targets = torch.zeros_like(rewards).to(rewards.device)
+    targets = torch.zeros_like(rewards)
+
     targets[:, -1] = target_qs[:, -1]
+
     for t in reversed(range(T - 1)):
-        targets[:, t] = rewards[:, t] + gamma * (
-            td_lambda * targets[:, t + 1] + (1 - td_lambda) * target_qs[:, t + 1]
-        ) # td_lambda * target_qs[:, t + 1] + (1 - td_lambda) * targets[:, t + 1]
+        bootstrap = td_lambda * targets[:, t + 1] + (1 - td_lambda) * target_qs[:, t + 1]
+        targets[:, t] = rewards[:, t] + gamma * bootstrap
+
     return targets
 
 
-# def plot_moving_average(rewards, window=20):
-#     avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
-#     plt.figure(figsize=(10, 4))
-#     plt.plot(avg)
-#     plt.title(f"Moving Average Reward (window={window})")
-#     plt.xlabel("Episode")
-#     plt.ylabel("Average Reward")
-#     plt.grid(True)
-#     plt.savefig("reward_moving_average.png")
-#     plt.show()
 
 
 class QMIX(nn.Module):
     def __init__(self,
                 env,
                 hidden_dims, 
-                #n_agents,
-                #obs_dim, 
-                #state_dim, 
-                #action_dim, 
                 batch_size = 64, 
                 buffer_capacity = 10000, 
                 lr=0.0003, 
                 gamma=0.95, 
                 epochs = 10,
                 max_steps = 200,
-                log_dir = "logs/qmix_discrete_logs",
+                log_dir = "logs/qmix_dca_logs",
                 plot_window = 100,
-                # entropy_coeff = 0.01,
                 clip_grad = None,
                 update_interval=100, 
-                device="cpu"
+                device="cpu",
+                tau=None,
+                decay_ratio = 0.99
                 ):
         super(QMIX, self).__init__()
-        # self.n_agents = n_agents
-        # self.obs_dim = obs_dim
-        # self.state_dim = state_dim
-        # self.action_dim = action_dim
 
         # Environment
         self.env = env
-        env.reset()
+        self.env.reset()
         self.agents = env.agents
-        self.n_agents = len(self.agents)
+        self.n_agents = len(self.agents) # N
         self.device = torch.device(device)
-        self.buffer = ReplayBufferRNN(buffer_capacity)
+        self.buffer = ReplayBufferRNN(buffer_capacity, device =self.device)
 
-        self.log_prefix = "qmix_" + "simple_spread"
+        self.log_prefix = "qmix_" + "dca"
 
 
         self.agent_nets = nn.ModuleDict()
         self.target_agent_nets = nn.ModuleDict()
-        self.mixing_net = {}
-        self.target_mixing_net = {}
-        self.optimizer = {}
         self.obs_spaces = {}
 
         for agent in self.agents:
-            obs_space = env.observation_space(agent)
-            # Compute total input dimension from discrete action space 
+            obs_space = env.observation_space[agent]
+            
             if isinstance(obs_space, gym.spaces.Dict):
                 obs_dim = sum(space.n if isinstance(space, gym.spaces.Discrete) else space.shape[0] for space in obs_space.spaces.values())
             else:
                 obs_dim = obs_space.n if isinstance(obs_space, gym.spaces.Discrete) else obs_space.shape[0]
-            # obs_dim = sum(space.n if isinstance(space, gym.spaces.Discrete) else space.shape[0] for space in obs_space.spaces.values()) 
-            act_dim = self.env.action_space(agent).n
+            
+            act_dim = self.env.action_space[agent].n
 
             self.agent_nets[agent] = AgentNetwork(obs_dim, act_dim, hidden_dims).to(self.device)
             self.target_agent_nets[agent] = AgentNetwork(obs_dim, act_dim, hidden_dims).to(self.device)
@@ -204,27 +246,25 @@ class QMIX(nn.Module):
         for agent in self.agent_nets.values():
             agent_params += list(agent.parameters())
 
-        self.mixing_net = MixingNetwork(self.n_agents, obs_dim, hidden_dims).to(self.device)
-        self.target_mixing_net = MixingNetwork(self.n_agents, obs_dim, hidden_dims).to(self.device)
-        self.optimizer = optim.Adam(agent_params+list(self.mixing_net.parameters()), 
-                                    lr=lr,
-                                    amsgrad=True)
+        self.mixing_net = MixingNetwork(self.n_agents, obs_dim * self.n_agents, hidden_dims).to(self.device)
+        self.target_mixing_net = MixingNetwork(self.n_agents, obs_dim * self.n_agents, hidden_dims).to(self.device)
 
-        self.batch_size = batch_size
+        self.optimizer = optim.Adam(agent_params+list(self.mixing_net.parameters()), lr=lr,amsgrad=True)
+
+        self.batch_size = batch_size # B
         self.gamma = gamma
         self.update_interval = update_interval
         self.epochs = epochs
-        self.max_steps = max_steps
+        self.max_steps = max_steps # T -> history 저장 길이..
         self.clip_grad = clip_grad
-        # self.entropy_coeff = entropy_coeff -> epsilon decay로 대체
+        self.epsilon = 1.0
+        self.epsilon_end = 0.05
+        self.decay_ratio = decay_ratio
+        self.step = 0
+        self.tau = tau
 
         self.logger = Logger(log_dir, self.log_prefix, plot_window)
-
-        self.epsilon_start = 1.0
-        self.epsilon_end = 0.05
-        self.step = 0
-
-        self.update_target(force=True)
+        self.update_target(tau=None)
 
     def preprocess_observation(self, obs, agent):
         # Convert Dictionary observation to a flat tensor
@@ -232,186 +272,284 @@ class QMIX(nn.Module):
 
         if isinstance(obs_space, gym.spaces.Dict):
             one_hots = []
-            for key, value in obs.items():
+            for key in obs_space.spaces.keys():
+                value = obs[key]
                 if isinstance(obs_space.spaces[key], gym.spaces.Discrete):
                     n = obs_space.spaces[key].n
                     one_hot = torch.zeros(n, device = self.device)
-                    one_hot[value] = 1.0
+                    one_hot[int(value)] = 1.0
                     one_hots.append(one_hot)
                 else:
-                    one_hots.append(torch.FloatTensor([value]))
-            return torch.cat(one_hots)
+                    v = np.array(value, dtype=np.float32).flatten()
+                    one_hots.append(torch.from_numpy(v).to(self.device))
+            obs_tensor = torch.cat(one_hots)
         elif isinstance(obs, np.ndarray):
-            return torch.FloatTensor(obs).to(self.device)
+            obs_tensor = torch.FloatTensor(obs).to(self.device)
         else:
             raise TypeError(f"Unsupported observation type: {type(obs)}")
-
-
-    def update_target(self, force=False): # hard update
-        if force or (self.step % self.update_interval == 0):
+        return obs_tensor.unsqueeze(0)
+    
+    ### 3. soft update
+    def update_target(self, tau=None):  # tau=None이면 hard update
+        if tau is None:
             for agent in self.agents:
                 self.target_agent_nets[agent].load_state_dict(self.agent_nets[agent].state_dict())
             self.target_mixing_net.load_state_dict(self.mixing_net.state_dict())
-
-
-    def epsilon_decay(self, step):
-        decay_ratio = max(0, (1 - step / 20000))
-        return self.epsilon_end + (self.epsilon_start - self.epsilon_end) * decay_ratio
-
-
-    def select_action(self, agent, obs, last_action, h_state):
-        '''
-        하나의 에이전트에 대한 action을 선택
-        Args: observation,
-        이전 action,
-        hidden state
-        
-        Returns: action(epsilon-greedy),
-        next hidden state
-        '''
-        epsilon = self.epsilon_decay(self.step)
-
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-        last_action_tensor = torch.FloatTensor(last_action).unsqueeze(0).to(self.device)
-        h_in = h_state.unsqueeze(0).to(self.device)
-
-        q_values, h_out = self.agent_nets[agent](obs_tensor, last_action_tensor, h_in)
-        q_values = q_values.squeeze(0)
-        h_out = h_out.squeeze(0)
-
-        if random.random() < epsilon:
-            action = random.randint(0, self.env.action_space(agent).n - 1)
         else:
-            action = q_values.argmax().item()
+            for agent in self.agents:
+                for target_param, param in zip(self.target_agent_nets[agent].parameters(), self.agent_nets[agent].parameters()):
+                    target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+            for target_param, param in zip(self.target_mixing_net.parameters(), self.mixing_net.parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-        return action, h_out
 
-    def update(self):
+    def epsilon_decay(self):
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.decay_ratio)  #1, 0.995, 0.990, 0.985 ... 0.01
+        return self.epsilon 
+
+
+    def select_action(self, agent, obs, last_action):
+
+        action_dim = self.env.action_space[agent].n
+
+        obs_tensor = torch.FloatTensor(obs).to(self.device) # (1, obs_dim)
+        if obs_tensor.dim() == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        
+        last_action_tensor = torch.FloatTensor(last_action).to(self.device) 
+        if last_action_tensor.dim() == 1:
+            last_action_tensor = last_action_tensor.unsqueeze(0)
+        
+        
+        # ε-greedy exploration
+        if random.random() < self.epsilon:
+            action = random.randint(0, action_dim - 1)
+        else:
+            obs_seq = obs_tensor.unsqueeze(0)         # (1, 1, obs_dim)
+            act_seq = last_action_tensor.unsqueeze(0) # (1, 1, act_dim)
+            q_seq, _ = self.agent_nets[agent](obs_seq, act_seq)  # (1, 1, action_dim)
+            q_vals = q_seq.squeeze(0).squeeze(0)  # (action_dim,)
+            action = torch.argmax(q_vals).item()
+
+        return action
+
+
+        
+    def update(self, alpha=0.1, seq_len =10):
+        '''
+        seq_len 길이의 시퀀스 배치 샘플링
+        각 timestep마다 agent별로 Q값 계산
+        qmix loss + per agent individual loss로 학습
+        '''
         if len(self.buffer) < self.batch_size:
-            return None
+            return 0.0
 
-        # 샘플링: (B, T+1, N, H), (B, T, N, obs), ...
-        hidden_seq, state, action, reward, next_state, done = self.buffer.sample(self.batch_size)
+        state, action, reward, next_state, done = self.buffer.sample(self.batch_size, seq_len)
         B, T, N, obs_dim = state.shape
 
-        device = self.device
         agent_qs, target_qs = [], []
-        metrics = {}
-
         for i, agent in enumerate(self.agents):
-            a_i = action[:, :, i].to(device)                      # (B, T)
-            s_i = state[:, :, i, :].to(device)                    # (B, T, obs)
-            ns_i = next_state[:, :, i, :].to(device)              # (B, T, obs)
+            a_i = action[:, :, i]                      # (B, T)
+            s_i = state[:, :, i, :]                    # (B, T, obs)
+            ns_i = next_state[:, :, i, :]              # (B, T, obs)
 
-            q_seq, tq_seq = [], []
-            for t in range(T):
-                h_i = hidden_seq[:, t, i, :].to(device) if t < hidden_seq.size(1) - 1 else None
-                a_onehot = F.one_hot(a_i[:, t], num_classes=self.env.action_space(agent).n).float().to(device)
+            a_onehot = F.one_hot(a_i, num_classes=self.env.action_space[agent].n).float()  # (B, T, A)
+            q_seq, _ = self.agent_nets[agent](s_i, a_onehot)             # (B, T, A)
+            q_selected = q_seq.gather(-1, a_i.unsqueeze(-1)).squeeze(-1)  # (B, T)
 
-                q_t, _ = self.agent_nets[agent](s_i[:, t], a_onehot, h_i)
-                q_selected = q_t.gather(1, a_i[:, t].unsqueeze(-1)).squeeze(-1)
-                q_seq.append(q_selected)
+            with torch.no_grad():
+                target_q_seq, _ = self.target_agent_nets[agent](ns_i, a_onehot)  # (B, T, A)
+                next_action = target_q_seq.argmax(dim=-1, keepdim=True)         # (B, T, 1)
+                q_target_selected = target_q_seq.gather(-1, next_action).squeeze(-1)  # (B, T)
 
-                with torch.no_grad():
-                    a_next_onehot = F.one_hot(next_action.squeeze(-1), num_classes=self.env.action_space(agent).n).float().to(device)
-                    q_next = self.agent_nets[agent](ns_i[:, t], a_next_onehot, h_i)[0]
-                    next_action = q_next.argmax(dim=1, keepdim=True)
-                    q_target, _ = self.target_agent_nets[agent](ns_i[:, t], a_onehot, h_i)
-                    tq = q_target.gather(1, next_action).squeeze(-1)
-                    tq_seq.append(tq)
+            agent_qs.append(q_selected)       # (B, T)
+            target_qs.append(q_target_selected)
 
-            agent_qs.append(torch.stack(q_seq, dim=1))     # (B, T)
-            target_qs.append(torch.stack(tq_seq, dim=1))   # (B, T)
+        agent_qs = torch.stack(agent_qs, dim=-1)     # (B, T, N)
+        target_qs = torch.stack(target_qs, dim=-1)   # (B, T, N)
 
-        # (B, T, N)
-        agent_qs = torch.stack(agent_qs, dim=2)
-        target_qs = torch.stack(target_qs, dim=2)
-
+        '''Mixing Network'''
         # (B, T, global_obs)
-        global_states = state.view(B, T, -1).to(device)
-        global_next_states = next_state.view(B, T, -1).to(device)
+        state = state.view(B, T, -1)
+        next_state = next_state.view(B, T, -1)
 
-        # Mixing network
-        q_total_list, tq_total_list = [], []
-        for t in range(T):
-            q_total = self.mixing_net(agent_qs[:, t, :], global_states[:, t, :])
-            tq_total = self.target_mixing_net(target_qs[:, t, :], global_next_states[:, t, :])
-            q_total_list.append(q_total)
-            tq_total_list.append(tq_total)
-
-        q_total = torch.stack(q_total_list, dim=1).squeeze(-1)     # (B, T)
-        tq_total = torch.stack(tq_total_list, dim=1).squeeze(-1)   # (B, T)
+        q_total = torch.stack([self.mixing_net(agent_qs[:,t], state[:,t]) for t in range(T)], dim=1)   
+        tq_total = torch.stack([self.target_mixing_net(target_qs[:,t], next_state[:,t]) for t in range(T)], dim=1) 
 
         # reward sum across agents (optional: per-agent reward instead)
-        r_total = reward.sum(dim=2).to(device)                     # (B, T)
+        r_total = reward.sum(dim=2)                   # (B, T)
         y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=0.8)
 
         # loss and optimization
-        loss = F.mse_loss(q_total, y_total.detach())
+        loss_qmix = F.mse_loss(q_total, y_total.detach())
+        
+        loss_ind = 0.0
+        for i in range(self.n_agents):
+            agent_q = agent_qs[:, :, i]
+            target_q = target_qs[:, :, i]
+            loss_ind += F.mse_loss(agent_q, target_q.detach())
+        loss_ind /= self.n_agents
+
+        loss = loss_qmix + alpha * loss_ind
+
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
             nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.clip_grad)
         self.optimizer.step()
 
+        self.epsilon_decay()
         self.step += 1
         self.update_target()
-        # avg_total_reward = r_total / self.step
-        # avg_loss= loss / self.step
-        # avg_entropy = self.epsilon_decay(self.step)  # ε 자체를 entropy 대용으로 기록
+        
+        # Per-agent metrics
+        per_agent_qs = agent_qs.detach().mean(dim=(0, 1))   # agent_qs.shape: (B, T, N)
+        avg_q_total = q_total.detach().mean().item()        # q_total.shape: (B, T)
+        td_errors = (agent_qs - target_qs.detach()) ** 2  # [B, T, N]
+        per_agent_losses = td_errors.mean(dim=(0, 1))  # [N]
 
-        for i, agent in enumerate(self.agents):
-            metrics[agent] = {
-                "loss": loss.item(),
-                "total_reward": r_total.sum().item() / B,
-                "entropy": self.epsilon_decay(self.step)  # ε 자체를 entropy 대용으로 기록
-            }
+        ### 1. Q individual
+        metrics = {
+            'avg_loss': loss.item(),
+            'avg_reward': r_total.mean().item(), # r_total.shape: (B, T)
+            'avg_q_total': avg_q_total,
+            'avg_entropy': self.epsilon_decay(),
+            'per_agent_qs': {agent: per_agent_qs[i].item() for i, agent in enumerate(self.agents)},
+            'per_agent_losses': {agent: per_agent_losses[i].item() for i, agent in enumerate(self.agents)}
+        }
         return metrics
     
-    def train(self, max_episode =1000, log_interval = 10):
-        for episode in range(max_episode):
-            agent_metrics = self.update()
+    ## 에피소드 단위로 버퍼에 수집
+    def rollout_episode(self): 
+        obs_dict, _ = self.env.reset()
+        if hasattr(self.env, "aec_env"):
+            for landmark in self.env.aec_env.unwrapped.world.landmarks:
+                landmark.state.p_vel = np.zeros(2)
+                landmark.movable = False
+                landmark.collide = False
 
-            if not agent_metrics:
-                #print(f"Episode {episode}: Not enough data in buffer to update.")
+        
+        obs = {agent: self.preprocess_observation(obs_dict[agent], agent) for agent in self.agents}
+        last_actions = {agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device) for agent in self.agents}
+        episode_data = []
+
+        for _ in range(self.max_steps):
+            actions = {}
+            # 각 에이전트 obs + last_action + hidden 이용해서 action + next_hidden 선택
+            for agent in self.agents:
+                action = self.select_action(agent, obs[agent], last_actions[agent])
+                #print(f"[DEBUG] obs.shape = {obs[agent].shape}, last_actions.shape = {last_actions[agent].shape}, h_states.shape = {h_states[agent].shape}")
+                actions[agent] = action
+
+            next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+            next_obs_proc = {agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents}
+            
+            
+            joint_obs = torch.stack([obs[agent].squeeze(0) for agent in self.agents])
+            joint_next_obs = torch.stack([next_obs_proc[agent].squeeze(0) for agent in self.agents])
+            joint_actions = torch.tensor([actions[agent] for agent in self.agents])
+            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents]).unsqueeze(-1)
+            joint_dones = torch.tensor([terminations[agent] for agent in self.agents]).unsqueeze(-1)
+            
+            episode_data.append((joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
+
+            obs = next_obs_proc
+            last_actions ={
+                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.env.action_space[agent].n).float().to(self.device) 
+                for agent in self.agents
+            } 
+
+            if all(terminations.values()) or all(truncations.values()):
+                break
+        
+        # 버퍼에 푸시
+        s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
+        self.buffer.push(
+            state_seq=torch.stack(s_seq),
+            action_seq=torch.stack(a_seq),
+            reward_seq=torch.stack(r_seq),
+            next_state_seq=torch.stack(ns_seq),
+            done_seq=torch.stack(d_seq)
+        )
+
+
+    def train(self, max_episode, log_interval = 1):
+        for episode in range(max_episode):
+            self.rollout_episode() # returns: {agent_0: [q0, q1, ..., qT], ...}
+            metrics = self.update(alpha=0.1, seq_len=10) # returns: {avg_loss, avg_reward, avg_q_total, per_agent_qs, per_agent_losses}
+
+            if not metrics:
                 continue
 
-            avg_reward = np.mean([metrics['total_reward'] for metrics in agent_metrics.values()])
-            avg_loss = np.mean([metrics['loss'] for metrics in agent_metrics.values()])
-            avg_entropy = np.mean([metrics['entropy'] for metrics in agent_metrics.values()])
-            
-            metrics = {
-                'avg_reward': avg_reward,
-                'avg_loss': avg_loss,
-                'avg_entropy': avg_entropy
+            # Log overall metrics
+            log_data = {
+                'avg_reward': metrics['avg_reward'],
+                'avg_q_total': metrics['avg_q_total'],
+                'avg_loss': metrics['avg_loss'],
+                #'avg_entropy': metrics['avg_entropy'],
             }
-            # for agent in self.agents:
-            #     metrics["avg_loss"] = agent_metrics['avg_loss']
-            #     metrics["avg_entropy"] = agent_metrics['avg_entropy']
-            #     metrics["avg_total_reward"] = agent_metrics['avg_reward']
-            self.logger.log_metrics(metrics, episode)
+
+            # Log per-agent metrics
+            for agent in self.agents:
+                log_data[f'{agent}_q_indiv'] = metrics['per_agent_qs'][agent]
+                log_data[f'{agent}_loss'] = metrics['per_agent_losses'][agent]
+            
+            self.logger.log_metrics(log_data, episode)
+
+            try:
+                self.env.save_render_data(save_dir="logs/render_data", episode=episode)
+            except Exception as e:
+                print(f"[ERROR] save_render_data failed at episode {episode}: {e}")
 
             if episode % log_interval == 0:
-                self.logger.info(f"Episode {episode} | Avg Reward: {avg_reward:>10.4f}")
+                self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}") 
+        self.logger.close()    
+        
 
-        self.logger.close()
 
     def save(self, path):
-        pass
+        checkpoint = {
+        "agent_nets": {agent: net.state_dict() for agent, net in self.agent_nets.items()},
+        "mixing_net": self.mixing_net.state_dict(),
+        "optimizer": self.optimizer.state_dict(),
+        "step": self.training_steps,  # 선택적: 현재 학습 단계
+        "args": {
+            "hidden_dims": self.hidden_dims,
+            "gamma": self.gamma,
+            "batch_size": self.batch_size,
+            # 필요한 하이퍼파라미터들 추가
+            }
+        }
+        torch.save(checkpoint, path)
+        print(f"[SAVE] Model saved to {path}")
 
     def load(self, path):
-        pass
+        checkpoint = torch.load(path, map_location=self.device)
+
+        for agent in self.agent_nets:
+            self.agent_nets[agent].load_state_dict(checkpoint["agent_nets"][agent])
+            
+        self.mixing_net.load_state_dict(checkpoint["mixing_net"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.training_steps = checkpoint.get("step", 0)
+
+        print(f"[LOAD] Model loaded from {path}")
 
 
 
-if __name__ == '__main__':
-    env = simple_spread_v3.parallel_env(N=3, max_cycles = 200, continuous_actions=False)
-    # env = aec_to_parallel(env)
-    hidden_dims = 128
+# if __name__ == '__main__':
+#     env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 200, continuous_actions=False)
+#     if hasattr(env, "aec_env"):
+#         for agent in env.aec_env.unwrapped.world.agents:
+#             agent.size = 0.02
+#     else:
+#         pass
+#     # env = aec_to_parallel(env)
+#     hidden_dims = 128
 
-    qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=32, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-                epochs=10, max_steps=200, log_dir="logs/qmix_discrete_logs", plot_window=100,
-                update_interval=100, device="cpu")
+#     qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
+#                 epochs=10, max_steps=200, log_dir="logs/qmix_simple_spread_logs", plot_window=100,
+#                 update_interval=100, device="cpu", tau=0.01)
 
-    qmix.train(max_episode=500, log_interval=10)
+#     qmix.train(max_episode=1000, log_interval=1)
     

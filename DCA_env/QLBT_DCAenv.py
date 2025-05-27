@@ -5,9 +5,7 @@ import matplotlib.colors as colors
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import random
-import torch
-from MARL_DCA.env.qmix3 import QMIX, ReplayBufferRNN
+from qmix2 import QMIX, ReplayBufferRNN
 import torch.nn.functional as F
 import time
 
@@ -402,12 +400,12 @@ class QLBT_DCAEnv(gym.Env):
                 print(f"[WARN] Skipped {key} for episode {episode}: length = {len(values)}")
 
 
-def obs_dict_to_vec(obs_dict):
-    return np.concatenate((
-        [obs_dict["channel_state"]],
-        [obs_dict["collision"]],
-        obs_dict["own_d2lt"]
-    )).astype(np.float32)
+# def obs_dict_to_vec(obs_dict):
+#     return np.concatenate((
+#         [obs_dict["channel_state"]],
+#         [obs_dict["collision"]],
+#         obs_dict["own_d2lt"]
+#     )).astype(np.float32)
 
     
 if __name__ == "__main__":
@@ -434,65 +432,6 @@ if __name__ == "__main__":
     )
 
     trainer.buffer = ReplayBufferRNN(capacity=10000, device="cpu")
-
-    # for episode in range(max_episodes):
-    #     obs_dict, _ = env.reset()
-    #     obs = {agent: trainer.preprocess_observation(obs_dict[agent], agent) for agent in env.agents}
-
-    #     h_states = {agent: torch.zeros(hidden_dim) for agent in env.agents}
-    #     last_actions = {agent: torch.zeros(action_dim) for agent in env.agents}
-
-    #     episode_data = []
-
-    #     for _ in range(max_cycles):
-    #         actions, h_next = {}, {}
-    #         for agent in env.agents:
-    #             action, h_new = trainer.select_action(
-    #                 agent=agent,
-    #                 obs=obs[agent],
-    #                 last_action=last_actions[agent],
-    #                 his_in=h_states[agent]
-    #             )
-    #             actions[agent] = action
-    #             h_next[agent] = h_new.detach()
-
-    #         obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
-            
-    #         # env.render()
-    #         next_obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
-
-    #         joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim()==2 else obs[agent] for agent in env.agents])
-    #         joint_next_obs = torch.stack([next_obs[agent].squeeze(0) if next_obs[agent].dim()==2 else next_obs[agent] for agent in env.agents])
-    #         joint_actions = torch.tensor([actions[agent] for agent in env.agents], dtype=torch.long)
-    #         joint_rewards = torch.tensor([rewards[agent] for agent in env.agents]).unsqueeze(-1) # q_tot
-    #         joint_dones = torch.tensor([terminations[agent] for agent in env.agents]).unsqueeze(-1)
-    #         joint_hidden = torch.stack([h_states[agent].detach() for agent in env.agents])
-
-    #         episode_data.append((joint_hidden, joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
-
-    #         obs = next_obs
-    #         h_states = h_next
-    #         last_actions = {
-    #             agent: F.one_hot(torch.tensor(actions[agent]), num_classes=action_dim).float() for agent in env.agents
-    #         }
-
-            
-
-    #         if all(terminations.values()) or all(truncations.values()):
-    #             break
-
-    #     h_seq, s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
-    #     hidden_seq = torch.stack(h_seq)  # (T, N, H)
-    #     assert hidden_seq.shape[-2:] == (num_agents, hidden_dim), f"Unexpected hidden_seq shape: {hidden_seq.shape}"
-
-    #     trainer.buffer.push(
-    #         hidden_seq=hidden_seq,
-    #         state_seq=torch.stack(s_seq),
-    #         action_seq=torch.stack(a_seq),
-    #         reward_seq=torch.stack(r_seq),
-    #         next_state_seq=torch.stack(ns_seq),
-    #         dones=torch.stack(d_seq)
-    #     )
 
     trainer.train(max_episode=max_episodes)
 
