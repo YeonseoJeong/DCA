@@ -9,7 +9,7 @@ from collections import deque
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
 from pettingzoo.utils.conversions import aec_to_parallel
-from logger import Logger
+from .logger import Logger
 
 '''
 QMIX
@@ -30,16 +30,22 @@ class AgentNetwork(nn.Module):
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
         self.gru = nn.GRUCell(hidden_dim, hidden_dim) 
         self.q_out = nn.Linear(hidden_dim, action_dim)
+        self.hidden_state = None
+    
+    def reset_hidden(self, batch_size=1, device=None):
+        device = device or next(self.parameters()).device
+        self.hidden_state = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-    def forward(self, obs, last_action, his_in):
+    def forward(self, obs, last_action):
         x = torch.cat([obs, last_action], dim=-1)
         x = F.relu(self.fc1(x))
-        if his_in is None:
-            his_in = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
-        else:
-            his_in = his_in.view(x.size(0), self.hidden_dim)  # Ensure his_in is the right shape
-        his_out = self.gru(x, his_in) 
-        q = self.q_out(his_out)
+
+        if self.hidden_state is None:
+            self.reset_hidden(batch_size = x.size(0), device=x.device)
+        
+        self.hidden_state = self.hidden_state.view(x.size(0), self.hidden_dim)  # Ensure his_in is the right shape
+        self.hidden_state = self.gru(x, self.hidden_state) 
+        q = self.q_out(self.hidden_state)
         return q
 
 
@@ -339,6 +345,10 @@ class QMIX(nn.Module):
             s_i = state[:, :, i, :]                  # (B, T, obs)
             ns_i = next_state[:, :, i, :]            # (B, T, obs)
 
+            # batch size = B
+            self.agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
+            self.target_agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
+
             q_seq, target_q_seq = [], []
 
             for t in range(T):
@@ -425,7 +435,10 @@ class QMIX(nn.Module):
             agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device)
             for agent in self.agents
         }
-
+        
+        for agent in self.agents:
+            self.agent_nets[agent].reset_hidden(batch_size=1, device=self.device)
+            
         for _ in range(self.max_steps):
             actions = {}
             for agent in self.agents:
