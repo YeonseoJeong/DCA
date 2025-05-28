@@ -9,7 +9,8 @@ from collections import deque
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
 from pettingzoo.utils.conversions import aec_to_parallel
-from .logger import Logger
+from utils.logger import Logger
+from utils.RnnReplaybuffer import ReplayBufferRNN
 
 '''
 QMIX
@@ -21,6 +22,7 @@ f: mixing network
 
 # 1. hidden_seq -> buffer에 넣을 필요 x
 # 2. seq단위로 history를 저장하고, agent별로 hidden state를 유지
+# 3. gru로 했는데 hidden_state업데이트하는 방식에서 gru cell과 차이가 있는 것 같음
 
 class AgentNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_dim=64):
@@ -28,25 +30,19 @@ class AgentNetwork(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim) 
+        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first = True) # (맨 앞에 batch 차원)
         self.q_out = nn.Linear(hidden_dim, action_dim)
-        self.hidden_state = None
-    
-    def reset_hidden(self, batch_size=1, device=None):
-        device = device or next(self.parameters()).device
-        self.hidden_state = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-    def forward(self, obs, last_action):
-        x = torch.cat([obs, last_action], dim=-1)
-        x = F.relu(self.fc1(x))
+    def forward(self, obs_seq, act_seq, h_0 = None):
+        x = torch.cat([obs_seq, act_seq], dim=-1) # (B, T, obs+act)
+        x = F.relu(self.fc1(x)) # (B, T, H)
+        if h_0 is None:
+            h_0 = torch.zeros(1, x.size(0), self.hidden_dim, device=x.device)
+ 
+        out_seq, h_n = self.gru(x, h_0) # out_seq: (B, T, H)
+        q_seq = self.q_out(out_seq)  # (B, T, act_dim)
 
-        if self.hidden_state is None:
-            self.reset_hidden(batch_size = x.size(0), device=x.device)
-        
-        self.hidden_state = self.hidden_state.view(x.size(0), self.hidden_dim)  # Ensure his_in is the right shape
-        self.hidden_state = self.gru(x, self.hidden_state) 
-        q = self.q_out(self.hidden_state)
-        return q
+        return q_seq, h_n.squeeze(0) # h_n: (1, B, H) → (B, H)
 
 
 class HyperNetwork(nn.Module):
@@ -79,108 +75,48 @@ class MixingNetwork(nn.Module):
         )
 
     def forward(self, agents_q, state): 
-        # agents_q : [q1, q2, ... , qn]
-        # state : [state_dim] = obs_dim * n_agents
+        # agents_q : [q1, q2, ... , qn]             (B, N)
+        # state : [state_dim] = obs_dim * n_agents  (B, state_dim)
+        B = agents_q.size(0)
+        # print(f"[DEBUG] agents_q.shape = {agents_q.shape}, state.shape = {state.shape}") 64,3 / 64,21
 
-        agents_q = agents_q.unsqueeze(0) if agents_q.dim() == 1 else agents_q   # [1, n_agents]
-        state = state.unsqueeze(0) if state.dim() ==1 else state                # [1, state_dim]
-
-        w1 = self.hyper_w1(state).view(-1, self.n_agents, self.hidden_dim)  # W1 = [1, n_agents, hidden_dim]
-        b1 = self.hyper_b1(state).view(-1, 1, self.hidden_dim)              # b1 = [1, 1, hidden_dim]
+        w1 = self.hyper_w1(state).view(B, self.n_agents, self.hidden_dim)  # W1 = (B, N, H)
+        b1 = self.hyper_b1(state).view(B, 1, self.hidden_dim)              # b1 = (B, 1, H)
         
-        hidden = F.elu(torch.bmm(agents_q.unsqueeze(1), w1) + b1).squeeze(1)             
-        # hidden = [1, 1, n_agents] * [1, n_agents, hidden_dim] + [1, 1, hidden_dim]
-        # hidden = [1, 1, hidden_dim(뒤에 2, 3차원이 곱해짐 앞에 batch_제외)] + [1, 1, hidden_dim] -> [1, hidden_dim]
+        hidden = F.elu(torch.bmm(agents_q.unsqueeze(1), w1) + b1)          # → (B, 1, H)       
 
-        w2 = self.hyper_w2(state).view(-1, self.hidden_dim, 1)              # W2 = [1, hidden_dim, 1]
-        b2 = self.hyper_b2(state)                                           # b2 = [1, 1] -> [1, 1]
+        w2 = self.hyper_w2(state).view(B, self.hidden_dim, 1)              # W2 = (B, H, 1)
+        b2 = self.hyper_b2(state)                                           # b2 = (B, 1)
 
-        q_total = torch.bmm(hidden.unsqueeze(1), w2).squeeze(1) + b2
-        # q_total = [1, 1, hidden_dim] * [1, hidden_dim, 1] + [1, 1]
-        # q_total = [1, 1] + [1, 1] -> [1, 1]
-        return q_total.squeeze()      # [1]
-    
+        q_total = torch.bmm(hidden, w2).squeeze(1) + b2
+        return q_total.squeeze(-1)      # [1]
 
-class ReplayBufferRNN:
+
+def td_lambda_target(rewards, target_qs, gamma=0.99, td_lambda=0.8):
     """
-    Replay buffer for RNN-based agents in QMIX (GRU 기반).
-    Stores full trajectories per episode, and returns fixed-length sequences during training.
+    Compute TD(λ) targets.
+    Inputs:
+        rewards:    (B, T) or (B, T, 1)
+        target_qs:  (B, T) or (B, T, 1)
+    Returns:
+        targets:    (B, T)
     """
-    def __init__(self, capacity=10000, device="cpu"):
-        self.buffer = deque(maxlen=capacity)
-        self.device = device
-
-    def push(self, state_seq, action_seq, reward_seq, next_state_seq, done_seq):
-        '''
-        Stores one full episode
-        - state_seq: (T, N, obs_dim)
-        - action_seq: (T, N)
-        - reward_seq: (T, N)
-        - next_state_seq: (T, N, obs_dim)
-        - done_seq: (T, N)
-        '''
-        if len(self.buffer) == self.buffer.maxlen:
-            self.buffer.popleft()
-        data = (
-            state_seq.detach(),
-            action_seq.detach(),
-            reward_seq.detach(),
-            next_state_seq.detach(),
-            done_seq.detach()
-        )
-        self.buffer.append(data)
-
-    def sample(self, batch_size, seq_len):
-        """
-        Samples fixed-length subsequences from stored full episodes.
-        Returns:
-            - state:      (B, seq_len, N, obs_dim)
-            - action:     (B, seq_len, N)
-            - reward:     (B, seq_len, N)
-            - next_state: (B, seq_len, N, obs_dim)
-            - done:       (B, seq_len, N)
-        """
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = [], [], [], [], []
-
-        while len(state_batch) < batch_size:
-            s_seq, a_seq, r_seq, ns_seq, d_seq = random.choice(self.buffer)
-            T = s_seq.size(0)
-            if T < seq_len:
-                continue
-            start_idx = random.randint(0, T - seq_len)
-            end_idx = start_idx + seq_len
-            state_batch.append(s_seq[start_idx:end_idx])
-            action_batch.append(a_seq[start_idx:end_idx])
-            reward_batch.append(r_seq[start_idx:end_idx])
-            next_state_batch.append(ns_seq[start_idx:end_idx])
-            done_batch.append(d_seq[start_idx:end_idx])
-            
-        s_tensor = torch.stack(state_batch).to(self.device)        # (B, seq_len, N, obs_dim)
-        a_tensor = torch.stack(action_batch).to(self.device)       # (B, seq_len, N)
-        r_tensor = torch.stack(reward_batch).to(self.device)       # (B, seq_len, N)
-        ns_tensor = torch.stack(next_state_batch).to(self.device)  # (B, seq_len, N, obs_dim)
-        d_tensor = torch.stack(done_batch).to(self.device)         # (B, seq_len, N)
-
-        return s_tensor, a_tensor, r_tensor, ns_tensor, d_tensor
-
-    def __len__(self):
-        return len(self.buffer)
-    
-
-def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=0.8):
-    if rewards.dim() > 2:
+    if rewards.dim() == 3:
         rewards = rewards.squeeze(-1)
-    if target_qs.dim() > 2:
+    if target_qs.dim() == 3:
         target_qs = target_qs.squeeze(-1)
 
     B, T = rewards.shape
-    targets = torch.zeros_like(rewards).to(rewards.device)
-    targets[:, -1] = target_qs[:, -1].detach()  # Last target Q value
+    targets = torch.zeros_like(rewards)
+
+    targets[:, -1] = target_qs[:, -1]
+
     for t in reversed(range(T - 1)):
-        targets[:, t] = rewards[:, t] + gamma * (
-            td_lambda * targets[:, t + 1] + (1 - td_lambda) * target_qs[:, t + 1]
-        ) # td_lambda * target_qs[:, t + 1] + (1 - td_lambda) * targets[:, t + 1]
+        bootstrap = td_lambda * targets[:, t + 1] + (1 - td_lambda) * target_qs[:, t + 1]
+        targets[:, t] = rewards[:, t] + gamma * bootstrap
+
     return targets
+
 
 
 
@@ -200,20 +136,13 @@ class QMIX(nn.Module):
                 update_interval=100, 
                 device="cpu",
                 tau=None,
-                decay_ratio = 0.98
+                decay_ratio = 0.99
                 ):
         super(QMIX, self).__init__()
-        
+
         # Environment
         self.env = env
         self.env.reset()
-        if hasattr(env, "aec_env"):
-            for landmark in env.aec_env.unwrapped.world.landmarks:
-                landmark.state.p_vel = np.zeros(2)
-                landmark.movable = False
-                landmark.collide = False
-        else:
-            pass
         self.agents = env.agents
         self.n_agents = len(self.agents) # N
         self.device = torch.device(device)
@@ -256,14 +185,13 @@ class QMIX(nn.Module):
         self.epochs = epochs
         self.max_steps = max_steps # T -> history 저장 길이..
         self.clip_grad = clip_grad
-        self.epsilon_start = 1.0
+        self.epsilon = 1.0
         self.epsilon_end = 0.05
         self.decay_ratio = decay_ratio
         self.step = 0
         self.tau = tau
 
         self.logger = Logger(log_dir, self.log_prefix, plot_window)
-
         self.update_target(tau=None)
 
     def preprocess_observation(self, obs, agent):
@@ -304,11 +232,13 @@ class QMIX(nn.Module):
 
 
     def epsilon_decay(self):
-        self.epsilon_start = max(self.epsilon_end, self.epsilon_start * self.decay_ratio)  #1, 0.995, 0.990, 0.985 ... 0.01
-        return self.epsilon_start 
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.decay_ratio)  #1, 0.995, 0.990, 0.985 ... 0.01
+        return self.epsilon 
 
 
     def select_action(self, agent, obs, last_action):
+
+        action_dim = self.env.action_space[agent].n
 
         obs_tensor = torch.FloatTensor(obs).to(self.device) # (1, obs_dim)
         if obs_tensor.dim() == 1:
@@ -318,73 +248,69 @@ class QMIX(nn.Module):
         if last_action_tensor.dim() == 1:
             last_action_tensor = last_action_tensor.unsqueeze(0)
         
-        q_values = self.agent_nets[agent](obs_tensor, last_action_tensor)
-        q_values = q_values.squeeze(0) if q_values.dim() > 1 and q_values.size(0) == 1 else q_values
-            
-        if random.random() < self.epsilon_start:
-            action = random.randint(0, self.env.action_space[agent].n - 1)
+        
+        # ε-greedy exploration
+        if random.random() < self.epsilon:
+            action = random.randint(0, action_dim - 1)
         else:
-            action = q_values.argmax().item()
+            obs_seq = obs_tensor.unsqueeze(0)         # (1, 1, obs_dim)
+            act_seq = last_action_tensor.unsqueeze(0) # (1, 1, act_dim)
+            q_seq, _ = self.agent_nets[agent](obs_seq, act_seq)  # (1, 1, action_dim)
+            q_vals = q_seq.squeeze(0).squeeze(0)  # (action_dim,)
+            action = torch.argmax(q_vals).item()
 
-       
         return action
 
+
         
-    def update(self, alpha=0.1, seq_len=10):
+    def update(self, alpha=0.1, seq_len =10):
+        '''
+        seq_len 길이의 시퀀스 배치 샘플링
+        각 timestep마다 agent별로 Q값 계산
+        qmix loss + per agent individual loss로 학습
+        '''
         if len(self.buffer) < self.batch_size:
             return 0.0
 
         state, action, reward, next_state, done = self.buffer.sample(self.batch_size, seq_len)
         B, T, N, obs_dim = state.shape
-        # print(f"[DEBUG] state.shape = {state.shape}, action.shape = {action.shape}, reward.shape = {reward.shape}, next_state.shape = {next_state.shape}, done.shape = {done.shape}")
-        
+
         agent_qs, target_qs = [], []
-
         for i, agent in enumerate(self.agents):
-            a_i = action[:, :, i]                    # (B, T)
-            s_i = state[:, :, i, :]                  # (B, T, obs)
-            ns_i = next_state[:, :, i, :]            # (B, T, obs)
+            a_i = action[:, :, i]                      # (B, T)
+            s_i = state[:, :, i, :]                    # (B, T, obs)
+            ns_i = next_state[:, :, i, :]              # (B, T, obs)
 
-            # batch size = B
-            self.agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
-            self.target_agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
+            a_onehot = F.one_hot(a_i, num_classes=self.env.action_space[agent].n).float()  # (B, T, A)
+            q_seq, _ = self.agent_nets[agent](s_i, a_onehot)             # (B, T, A)
+            q_selected = q_seq.gather(-1, a_i.unsqueeze(-1)).squeeze(-1)  # (B, T)
 
-            q_seq, target_q_seq = [], []
+            with torch.no_grad():
+                target_q_seq, _ = self.target_agent_nets[agent](ns_i, a_onehot)  # (B, T, A)
+                next_action = target_q_seq.argmax(dim=-1, keepdim=True)         # (B, T, 1)
+                q_target_selected = target_q_seq.gather(-1, next_action).squeeze(-1)  # (B, T)
 
-            for t in range(T):
-                obs_t = s_i[:, t]  # (B, obs_dim)
-                act_t = a_i[:, t]  # (B,)
-                a_onehot_t = F.one_hot(act_t, num_classes=self.env.action_space[agent].n).float()  # (B, A)
-
-                q = self.agent_nets[agent](obs_t, a_onehot_t)
-                q_selected = q.gather(-1, act_t.unsqueeze(-1)).squeeze(-1)  # (B, T)
-                q_seq.append(q_selected.unsqueeze(1))  # (B, 1)
-
-                with torch.no_grad():
-                    next_obs_t = ns_i[:, t]  # (B, obs_dim)
-                    q_target_all = self.target_agent_nets[agent](next_obs_t, a_onehot_t)
-                    next_a = q_target_all.argmax(dim=-1, keepdim=True)         # (B, T, 1)
-                    q_target = q_target_all.gather(-1, next_a).squeeze(-1)  # (B, T)
-                    target_q_seq.append(q_target.unsqueeze(1))  # (B, 1)
-
-            agent_qs.append(torch.cat(q_seq, dim =1))       # (B, T)
-            target_qs.append(torch.cat(target_q_seq, dim =1)) # (B, T)
+            agent_qs.append(q_selected)       # (B, T)
+            target_qs.append(q_target_selected)
 
         agent_qs = torch.stack(agent_qs, dim=-1)     # (B, T, N)
         target_qs = torch.stack(target_qs, dim=-1)   # (B, T, N)
 
+        '''Mixing Network'''
+        # (B, T, global_obs)
         state = state.view(B, T, -1)
         next_state = next_state.view(B, T, -1)
 
-        q_total = torch.stack([self.mixing_net(agent_qs[:, t], state[:, t]) for t in range(T)], dim=1)
-        tq_total = torch.stack([self.target_mixing_net(target_qs[:, t], next_state[:, t]) for t in range(T)], dim=1)
+        q_total = torch.stack([self.mixing_net(agent_qs[:,t], state[:,t]) for t in range(T)], dim=1)   
+        tq_total = torch.stack([self.target_mixing_net(target_qs[:,t], next_state[:,t]) for t in range(T)], dim=1) 
 
+        # reward sum across agents (optional: per-agent reward instead)
         r_total = reward.sum(dim=2)                   # (B, T)
         y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=0.8)
 
-        # Loss
+        # loss and optimization
         loss_qmix = F.mse_loss(q_total, y_total.detach())
-
+        
         loss_ind = 0.0
         for i in range(self.n_agents):
             agent_q = agent_qs[:, :, i]
@@ -393,6 +319,7 @@ class QMIX(nn.Module):
         loss_ind /= self.n_agents
 
         loss = loss_qmix + alpha * loss_ind
+
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
@@ -402,15 +329,17 @@ class QMIX(nn.Module):
         self.epsilon_decay()
         self.step += 1
         self.update_target()
+        
+        # Per-agent metrics
+        per_agent_qs = agent_qs.detach().mean(dim=(0, 1))   # agent_qs.shape: (B, T, N)
+        avg_q_total = q_total.detach().mean().item()        # q_total.shape: (B, T)
+        td_errors = (agent_qs - target_qs.detach()) ** 2  # [B, T, N]
+        per_agent_losses = td_errors.mean(dim=(0, 1))  # [N]
 
-        per_agent_qs = agent_qs.detach().mean(dim=(0, 1))
-        avg_q_total = q_total.detach().mean().item()
-        td_errors = (agent_qs - target_qs.detach()) ** 2
-        per_agent_losses = td_errors.mean(dim=(0, 1))
-
+        ### 1. Q individual
         metrics = {
             'avg_loss': loss.item(),
-            'avg_reward': r_total.mean().item(),
+            'avg_reward': r_total.mean().item(), # r_total.shape: (B, T)
             'avg_q_total': avg_q_total,
             'avg_entropy': self.epsilon_decay(),
             'per_agent_qs': {agent: per_agent_qs[i].item() for i, agent in enumerate(self.agents)},
@@ -418,56 +347,50 @@ class QMIX(nn.Module):
         }
         return metrics
     
-    def rollout_episode(self):
-        env = self.env
-        obs_dict, _ = env.reset()
-
-        if hasattr(env, "aec_env"):
-            for landmark in env.aec_env.unwrapped.world.landmarks:
+    ## 에피소드 단위로 버퍼에 수집
+    def rollout_episode(self): 
+        obs_dict, _ = self.env.reset()
+        if hasattr(self.env, "aec_env"):
+            for landmark in self.env.aec_env.unwrapped.world.landmarks:
                 landmark.state.p_vel = np.zeros(2)
                 landmark.movable = False
                 landmark.collide = False
 
+        
+        obs = {agent: self.preprocess_observation(obs_dict[agent], agent) for agent in self.agents}
+        last_actions = {agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device) for agent in self.agents}
         episode_data = []
 
-        obs = {agent: self.preprocess_observation(obs_dict[agent], agent) for agent in self.agents}
-        last_actions = {
-            agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device)
-            for agent in self.agents
-        }
-        
-        for agent in self.agents:
-            self.agent_nets[agent].reset_hidden(batch_size=1, device=self.device)
-            
         for _ in range(self.max_steps):
             actions = {}
+            # 각 에이전트 obs + last_action + hidden 이용해서 action + next_hidden 선택
             for agent in self.agents:
                 action = self.select_action(agent, obs[agent], last_actions[agent])
+                #print(f"[DEBUG] obs.shape = {obs[agent].shape}, last_actions.shape = {last_actions[agent].shape}, h_states.shape = {h_states[agent].shape}")
                 actions[agent] = action
 
-            next_obs, rewards, terminations, truncations, infos = env.step(actions)
-
-            next_obs_proc = {
-                agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents
-            }
-            joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim() == 2 else obs[agent] for agent in self.agents])
-            joint_next_obs = torch.stack([next_obs_proc[agent].squeeze(0) if next_obs_proc[agent].dim() == 2 else next_obs_proc[agent] for agent in self.agents])
+            next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+            next_obs_proc = {agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents}
+            
+            
+            joint_obs = torch.stack([obs[agent].squeeze(0) for agent in self.agents])
+            joint_next_obs = torch.stack([next_obs_proc[agent].squeeze(0) for agent in self.agents])
             joint_actions = torch.tensor([actions[agent] for agent in self.agents])
-            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents])
-            joint_dones = torch.tensor([terminations[agent] for agent in self.agents])
-
+            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents]).unsqueeze(-1)
+            joint_dones = torch.tensor([terminations[agent] for agent in self.agents]).unsqueeze(-1)
+            
             episode_data.append((joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
 
             obs = next_obs_proc
-
-            last_actions = {
-                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.env.action_space[agent].n).float().to(self.device)
+            last_actions ={
+                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.env.action_space[agent].n).float().to(self.device) 
                 for agent in self.agents
-            }
+            } 
 
             if all(terminations.values()) or all(truncations.values()):
                 break
-
+        
+        # 버퍼에 푸시
         s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
         self.buffer.push(
             state_seq=torch.stack(s_seq),
@@ -476,8 +399,6 @@ class QMIX(nn.Module):
             next_state_seq=torch.stack(ns_seq),
             done_seq=torch.stack(d_seq)
         )
-
-
 
 
     def train(self, max_episode, log_interval = 1):

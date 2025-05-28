@@ -9,12 +9,8 @@ from collections import deque
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
 from pettingzoo.utils.conversions import aec_to_parallel
-from env.logger import Logger
-
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from DCA.dca_env.DCAenv import DCAEnv
+from utils.logger import Logger
+from utils.RnnReplaybuffer import ReplayBufferRNN2
 
 '''
 QMIX
@@ -24,10 +20,9 @@ Qtot(τ, u, s; θ) = f(Q1(τ1, u1, s; θ), Q2(τ2, u2, s; θ), ..., Qn(τn, un, 
 f: mixing network
 '''
 
-# 1. Q individual - 해결
+# 1. Q individual
 # 2. graph -> episode 0부터
-# 3. soft update - 해결
-# 4. matplotlib 띄우도록 
+# 3. soft update
 
 class AgentNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_dim=64):
@@ -105,48 +100,7 @@ class MixingNetwork(nn.Module):
         return q_total.squeeze()      # [1]
     
 
-class ReplayBufferRNN: 
-    '''
-    state = joint_obs,
-    joint_action,                
-    reward,                        
-    next_state = next_joint_obs, 
-    joint_hidden_state,          
-    joint_done        
-    .detach()를 통해 gradient를 끊어, backpropagation을 하지 않음 -> 메모리 누수나 에러 방지            
-    '''
-    def __init__(self, capacity=10000, device="cpu"):
-        self.buffer = deque(maxlen=capacity)
-        self.device = device
 
-    def push(self, hidden_seq, state_seq, action_seq, reward_seq, next_state_seq, dones):
-        if len(self.buffer) == self.buffer.maxlen:
-            self.buffer.popleft()
-        data = (hidden_seq.detach(), 
-                state_seq.detach(), 
-                action_seq.detach(), 
-                reward_seq.detach(), 
-                next_state_seq.detach(), 
-                dones.detach())
-        self.buffer.append(data)
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        h_lst, s_lst, a_lst, r_lst, ns_lst, dn_lst = zip(*batch)
-        '''
-        B = batch_size, T = max_step, N = n_agents, H_dim = hidden_dim, obs_dim = observation_dim
-        '''
-        h_tensor = torch.stack(h_lst).to(self.device)     # (B, T+1, N, H_dim) 
-        s_tensor = torch.stack(s_lst).to(self.device)     # (B, T, N, obs_dim)
-        a_tensor = torch.stack(a_lst).long().unsqueeze(-1).to(self.device)      # action.shape = (B, T, N) -> (B, T, N, 1)
-        r_tensor = torch.stack(r_lst).unsqueeze(-1).to(self.device)             # reward.shape = (B, T) -> (B, T, 1), q_tot
-        ns_tensor = torch.stack(ns_lst).to(self.device)   # (B, T, N, obs_dim)
-        d_tensor = torch.stack(dn_lst).unsqueeze(-1).to(self.device)            # dones.shape = (B, T, N) -> (B, T, N, 1)
-
-        return h_tensor, s_tensor, a_tensor, r_tensor, ns_tensor, d_tensor
-
-    def __len__(self):
-        return len(self.buffer)
 
 
 def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=0.8):
@@ -176,24 +130,32 @@ class QMIX(nn.Module):
                 gamma=0.95, 
                 epochs = 10,
                 max_steps = 200,
-                log_dir = "logs/qmix_simple_spread_logs",
+                log_dir = "logs/qmix_dca_logs",
                 plot_window = 100,
                 clip_grad = None,
                 update_interval=100, 
                 device="cpu",
-                tau=None
+                tau=None,
+                decay_ratio = 0.99
                 ):
         super(QMIX, self).__init__()
         
         # Environment
         self.env = env
-        env.reset()
+        self.env.reset()
+        if hasattr(env, "aec_env"):
+            for landmark in env.aec_env.unwrapped.world.landmarks:
+                landmark.state.p_vel = np.zeros(2)
+                landmark.movable = False
+                landmark.collide = False
+        else:
+            pass
         self.agents = env.agents
         self.n_agents = len(self.agents) # N
         self.device = torch.device(device)
-        self.buffer = ReplayBufferRNN(buffer_capacity, device =self.device)
+        self.buffer = ReplayBufferRNN2(buffer_capacity, device =self.device)
 
-        self.log_prefix = "qmix_" + "simple_spread"
+        self.log_prefix = "qmix_" + "dca"
 
 
         self.agent_nets = nn.ModuleDict()
@@ -201,14 +163,14 @@ class QMIX(nn.Module):
         self.obs_spaces = {}
 
         for agent in self.agents:
-            obs_space = env.observation_space(agent)
+            obs_space = env.observation_space[agent]
             
             if isinstance(obs_space, gym.spaces.Dict):
                 obs_dim = sum(space.n if isinstance(space, gym.spaces.Discrete) else space.shape[0] for space in obs_space.spaces.values())
             else:
                 obs_dim = obs_space.n if isinstance(obs_space, gym.spaces.Discrete) else obs_space.shape[0]
             
-            act_dim = self.env.action_space(agent).n
+            act_dim = self.env.action_space[agent].n
 
             self.agent_nets[agent] = AgentNetwork(obs_dim, act_dim, hidden_dims).to(self.device)
             self.target_agent_nets[agent] = AgentNetwork(obs_dim, act_dim, hidden_dims).to(self.device)
@@ -232,7 +194,7 @@ class QMIX(nn.Module):
         self.clip_grad = clip_grad
         self.epsilon_start = 1.0
         self.epsilon_end = 0.05
-        self.decay_ratio = 0.995
+        self.decay_ratio = decay_ratio
         self.step = 0
         self.tau = tau
 
@@ -246,14 +208,16 @@ class QMIX(nn.Module):
 
         if isinstance(obs_space, gym.spaces.Dict):
             one_hots = []
-            for key, value in obs.items():
+            for key in obs_space.spaces.keys():
+                value = obs[key]
                 if isinstance(obs_space.spaces[key], gym.spaces.Discrete):
                     n = obs_space.spaces[key].n
                     one_hot = torch.zeros(n, device = self.device)
-                    one_hot[value] = 1.0
+                    one_hot[int(value)] = 1.0
                     one_hots.append(one_hot)
                 else:
-                    one_hots.append(torch.FloatTensor([value]))
+                    v = np.array(value, dtype=np.float32).flatten()
+                    one_hots.append(torch.from_numpy(v).to(self.device))
             obs_tensor = torch.cat(one_hots)
         elif isinstance(obs, np.ndarray):
             obs_tensor = torch.FloatTensor(obs).to(self.device)
@@ -302,7 +266,7 @@ class QMIX(nn.Module):
         h_out = h_out.squeeze(0) # (H_dim)
 
         if random.random() < self.epsilon_start:
-            action = random.randint(0, self.env.action_space(agent).n - 1)
+            action = random.randint(0, self.env.action_space[agent].n - 1)
         else:
             action = q_values.argmax().item()
 
@@ -312,7 +276,7 @@ class QMIX(nn.Module):
         return action, h_out #, q_selected
 
         
-    def update(self):
+    def update(self, alpha=0.1):
         ### 2. graph -> episode 0부터
         if len(self.buffer) < self.batch_size:
             return 0.0
@@ -331,7 +295,7 @@ class QMIX(nn.Module):
             q_seq, tq_seq = [], []
             for t in range(T):
                 h_i = hidden_seq[:, t, i, :] if t < hidden_seq.size(1) - 1 else hidden_seq[:, -1, i, :]
-                a_onehot = F.one_hot(a_i[:, t], num_classes=self.env.action_space(agent).n).float()
+                a_onehot = F.one_hot(a_i[:, t], num_classes=self.env.action_space[agent].n).float()
 
                 if a_onehot.dim() != s_i[:,t].dim():
                     a_onehot = a_onehot.view(s_i[:,t].size(0), -1)
@@ -367,7 +331,16 @@ class QMIX(nn.Module):
         y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=0.8)
 
         # loss and optimization
-        loss = F.mse_loss(q_total, y_total.detach())
+        loss_qmix = F.mse_loss(q_total, y_total.detach())
+        
+        loss_ind = 0.0
+        for i in range(self.n_agents):
+            agent_q = agent_qs[:, :, i]
+            target_q = target_qs[:, :, i]
+            loss_ind += F.mse_loss(agent_q, target_q.detach())
+        loss_ind /= self.n_agents
+
+        loss = loss_qmix + alpha * loss_ind
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
@@ -383,14 +356,14 @@ class QMIX(nn.Module):
         avg_q_total = q_total.detach().mean().item()        # q_total.shape: (B, T)
 
         # per_agent_rewards = reward.mean(dim=1).squeeze(-1).mean(dim=0)  # [N]
-        per_agent_losses = agent_qs.detach() - target_qs.detach()  # [B, T, N]
-        per_agent_losses = (per_agent_losses ** 2).mean(dim=(0, 1))  # [N]
+        td_errors = (agent_qs - target_qs.detach()) ** 2  # [B, T, N]
+        per_agent_losses = td_errors.mean(dim=(0, 1))  # [N]
 
         ### 1. Q individual
         metrics = {
             'avg_loss': loss.item(),
-            'avg_reward': r_total.sum().item() / (B*N),
-            'avg_q_total': q_total.detach().mean().item(),
+            'avg_reward': r_total.mean().item(), # r_total.shape: (B, T)
+            'avg_q_total': avg_q_total,
             'avg_entropy': self.epsilon_decay(),
             'per_agent_qs': {agent: per_agent_qs[i].item() for i, agent in enumerate(self.agents)},
             'per_agent_losses': {agent: per_agent_losses[i].item() for i, agent in enumerate(self.agents)}
@@ -400,14 +373,21 @@ class QMIX(nn.Module):
     def rollout_episode(self): ## 에피소드 단위로 collect 
         env = self.env
         obs_dict, _ = self.env.reset()
+        if hasattr(env, "aec_env"):
+            for landmark in env.aec_env.unwrapped.world.landmarks:
+                landmark.state.p_vel = np.zeros(2)
+                landmark.movable = False
+                landmark.collide = False
+        else:
+            pass
         episode_data = []
 
         obs = {agent: self.preprocess_observation(obs_dict[agent], agent) for agent in self.agents}
         h_states = {agent: torch.zeros(1, self.agent_nets[agent].hidden_dim, device=self.device) for agent in self.agents}
-        last_actions = {agent: torch.zeros(1, self.env.action_space(agent).n, device=self.device) for agent in self.agents}
+        last_actions = {agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device) for agent in self.agents}
 
         for _ in range(self.max_steps):
-            actions, h_next, q_selected_dict = {}, {}, {}
+            actions, h_next = {}, {}
             for agent in self.agents:
                 action, h_new = self.select_action(agent, obs[agent], last_actions[agent], h_states[agent])
                 #print(f"[DEBUG] obs.shape = {obs[agent].shape}, last_actions.shape = {last_actions[agent].shape}, h_states.shape = {h_states[agent].shape}")
@@ -425,15 +405,14 @@ class QMIX(nn.Module):
             joint_actions = torch.tensor([actions[agent] for agent in self.agents])
             joint_rewards = torch.tensor([rewards[agent] for agent in self.agents]).unsqueeze(-1)
             joint_dones = torch.tensor([terminations[agent] for agent in self.agents]).unsqueeze(-1)
-            joint_hidden = torch.stack([h_states[agent].unsqueeze(0) if h_states[agent].dim()==1 else h_states[agent]
-                                        for agent in self.agents])
+            joint_hidden = torch.stack([h_states[agent].reshape(-1) for agent in self.agents])
 
             episode_data.append((joint_hidden, joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
 
             obs = next_obs_proc
             h_states = h_next
             last_actions ={
-                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.env.action_space(agent).n).float().to(self.device) for agent in self.agents
+                agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.env.action_space[agent].n).float().to(self.device) for agent in self.agents
             } 
 
             if all(terminations.values()) or all(truncations.values()):
@@ -451,11 +430,10 @@ class QMIX(nn.Module):
         )
 
 
-    
-    def train(self, max_episode =1000, log_interval = 10):
+    def train(self, max_episode, log_interval = 1):
         for episode in range(max_episode):
             self.rollout_episode() # returns: {agent_0: [q0, q1, ..., qT], ...}
-            metrics = self.update()
+            metrics = self.update(alpha=0.1) # returns: {avg_loss, avg_reward, avg_q_total, per_agent_qs, per_agent_losses}
 
             if not metrics:
                 continue
@@ -465,7 +443,7 @@ class QMIX(nn.Module):
                 'avg_reward': metrics['avg_reward'],
                 'avg_q_total': metrics['avg_q_total'],
                 'avg_loss': metrics['avg_loss'],
-                'avg_entropy': metrics['avg_entropy'],
+                #'avg_entropy': metrics['avg_entropy'],
             }
 
             # Log per-agent metrics
@@ -475,59 +453,60 @@ class QMIX(nn.Module):
             
             self.logger.log_metrics(log_data, episode)
 
-            if episode % log_interval == 0:
-                self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}")
-                # self.logger.info(
-                # f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | "
-                # f"Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f} | "
-                # + " | ".join([f"{agent}_Q: {avg_q_values[agent]:.2f}" for agent in self.agents])
-                # )
+            try:
+                self.env.save_render_data(save_dir="logs/render_data", episode=episode)
+            except Exception as e:
+                print(f"[ERROR] save_render_data failed at episode {episode}: {e}")
 
-        self.logger.close()
+            if episode % log_interval == 0:
+                self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}") 
+        self.logger.close()    
+        
+
 
     def save(self, path):
-        pass
+        checkpoint = {
+        "agent_nets": {agent: net.state_dict() for agent, net in self.agent_nets.items()},
+        "mixing_net": self.mixing_net.state_dict(),
+        "optimizer": self.optimizer.state_dict(),
+        "step": self.training_steps,  # 선택적: 현재 학습 단계
+        "args": {
+            "hidden_dims": self.hidden_dims,
+            "gamma": self.gamma,
+            "batch_size": self.batch_size,
+            # 필요한 하이퍼파라미터들 추가
+            }
+        }
+        torch.save(checkpoint, path)
+        print(f"[SAVE] Model saved to {path}")
 
     def load(self, path):
-        pass
+        checkpoint = torch.load(path, map_location=self.device)
+
+        for agent in self.agent_nets:
+            self.agent_nets[agent].load_state_dict(checkpoint["agent_nets"][agent])
+            
+        self.mixing_net.load_state_dict(checkpoint["mixing_net"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.training_steps = checkpoint.get("step", 0)
+
+        print(f"[LOAD] Model loaded from {path}")
 
 
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
+#     env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 200, continuous_actions=False)
+#     if hasattr(env, "aec_env"):
+#         for agent in env.aec_env.unwrapped.world.agents:
+#             agent.size = 0.02
+#     else:
+#         pass
+#     # env = aec_to_parallel(env)
+#     hidden_dims = 128
 
-    num_nodes = 5
-    max_steps = 1000
-    env = DCAEnv(num_agents=num_nodes, max_cycles=max_steps, render_mode='rgb_array')
+#     qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
+#                 epochs=10, max_steps=200, log_dir="logs/qmix_simple_spread_logs", plot_window=100,
+#                 update_interval=100, device="cpu", tau=0.01)
 
-    # env = simple_spread_v3.parallel_env(N=3, max_cycles = 200, continuous_actions=False)
-    # env = aec_to_parallel(env)
-    hidden_dims = 128
-
-    qmix = QMIX(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-                epochs=10, max_steps=200, log_dir="logs/qmix_simple_spread_logs", plot_window=100,
-                update_interval=100, device="cpu", tau=0.01)
-
-    qmix.train(max_episode=1000, log_interval=10)
-
-    
-    # agents = [CSMA_CA_Agent(i, cw_min=2, cw_max=16) for i in range(num_nodes)]
-    
-    # total_reward = 0
-
-    # observation, _ = env.reset() 
-    # actions_csma = np.array([agent.act(observation) for agent in agents])
- 
-    # for _ in range(max_steps):
-    #     action = np.array([agent.act(observation) for agent in agents])
-    #     next_obs, reward, terminated, truncated, info = env.step(action) 
-    #     env.render()
-    #     total_reward += reward
-    #     observation = next_obs
-    #     if terminated or truncated: #window+c -> 종료 
-    #         break
-
-    # if not env.NOTEBOOK:
-    #     plt.show()
-
-    # print(f"average episode reward (CSMA): {total_reward / max_steps}")
+#     qmix.train(max_episode=1000, log_interval=1)
     
