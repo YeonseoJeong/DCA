@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import random
-from collections import deque
 
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3

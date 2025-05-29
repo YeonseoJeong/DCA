@@ -29,25 +29,25 @@ class AgentNetwork(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim) 
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)  # 히스토리 저장
         self.q_out = nn.Linear(hidden_dim, action_dim)
-        self.hidden_state = None
-    
-    def reset_hidden(self, batch_size=1, device=None):
-        device = device or next(self.parameters()).device
-        self.hidden_state = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-    def forward(self, obs, last_action):
+    def forward(self, obs, last_action, his_in):
         x = torch.cat([obs, last_action], dim=-1)
         x = F.relu(self.fc1(x))
+        if his_in is None:
+            his_in = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
+        else:
+            # his_in = his_in.view(x.size(0), -1)  # 이거 그냥 무작정 쓰면 위험
+            try:
+                his_in = his_in.reshape(x.size(0), self.hidden_dim)
+            except Exception as e:
+                raise ValueError(f"Invalid hidden state shape: {his_in.shape}") from e
 
-        if self.hidden_state is None:
-            self.reset_hidden(batch_size = x.size(0), device=x.device)
-        
-        self.hidden_state = self.hidden_state.view(x.size(0), self.hidden_dim)  # Ensure his_in is the right shape
-        self.hidden_state = self.gru(x, self.hidden_state) 
-        q = self.q_out(self.hidden_state)
-        return q
+        his_out = self.gru(x, his_in) 
+        q = self.q_out(his_out)
+        return q, his_out
+
 
 
 class HyperNetwork(nn.Module):
@@ -101,9 +101,8 @@ class MixingNetwork(nn.Module):
         # q_total = [1, 1] + [1, 1] -> [1, 1]
         return q_total.squeeze()      # [1]
 
-    
 
-def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=0.8):
+def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=1.0):
     if rewards.dim() > 2:
         rewards = rewards.squeeze(-1)
     if target_qs.dim() > 2:
@@ -115,7 +114,8 @@ def td_lambda_target(rewards, target_qs, gamma=0.95, td_lambda=0.8):
     for t in reversed(range(T - 1)):
         targets[:, t] = rewards[:, t] + gamma * (
             td_lambda * targets[:, t + 1] + (1 - td_lambda) * target_qs[:, t + 1]
-        ) # td_lambda * target_qs[:, t + 1] + (1 - td_lambda) * targets[:, t + 1]
+        ) 
+        # Qtot(τ, u, s; θ) = r_t+ γ * (λ * Qtot(τ ′, u′, s′; θ−) + (1 − λ) * Qtot(τ ′, u′, s′; θ))
     return targets
 
 
@@ -135,7 +135,7 @@ class QMIX(nn.Module):
                 clip_grad = None,
                 update_interval=100, 
                 device="cpu",
-                tau=None,
+                tau=0.01,
                 decay_ratio = 0.98
                 ):
         super(QMIX, self).__init__()
@@ -153,8 +153,8 @@ class QMIX(nn.Module):
         self.agents = env.agents
         self.n_agents = len(self.agents) # N
         self.device = torch.device(device)
-        self.buffer = ReplayBufferRNN(buffer_capacity, device =self.device)
-
+        self.buffer = ReplayBufferRNN(capacity=buffer_capacity, device =self.device)
+        self.hidden_dims = hidden_dims
         self.log_prefix = "qmix_" + "dca"
 
 
@@ -244,7 +244,7 @@ class QMIX(nn.Module):
         return self.epsilon_start 
 
 
-    def select_action(self, agent, obs, last_action):
+    def select_action(self, agent, obs, last_action, h_in):
 
         obs_tensor = torch.FloatTensor(obs).to(self.device) # (1, obs_dim)
         if obs_tensor.dim() == 1:
@@ -254,7 +254,7 @@ class QMIX(nn.Module):
         if last_action_tensor.dim() == 1:
             last_action_tensor = last_action_tensor.unsqueeze(0)
         
-        q_values = self.agent_nets[agent](obs_tensor, last_action_tensor)
+        q_values, h_out = self.agent_nets[agent](obs_tensor, last_action_tensor, h_in)
         q_values = q_values.squeeze(0) if q_values.dim() > 1 and q_values.size(0) == 1 else q_values
             
         if random.random() < self.epsilon_start:
@@ -263,10 +263,10 @@ class QMIX(nn.Module):
             action = q_values.argmax().item()
 
        
-        return action
+        return action, h_out
 
         
-    def update(self, alpha=0.1, seq_len=10):
+    def update(self, alpha=0.2, seq_len=10):
         if len(self.buffer) < self.batch_size:
             return 0.0
 
@@ -281,9 +281,8 @@ class QMIX(nn.Module):
             s_i = state[:, :, i, :]                  # (B, T, obs)
             ns_i = next_state[:, :, i, :]            # (B, T, obs)
 
-            # batch size = B
-            self.agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
-            self.target_agent_nets[agent].reset_hidden(batch_size=B, device=s_i.device)
+            h = torch.zeros(B, self.agent_nets[agent].hidden_dim, device=self.device)  # (B, hidden_dim)
+            h_target = torch.zeros_like(h)  # (B, hidden_dim)
 
             q_seq, target_q_seq = [], []
 
@@ -292,13 +291,13 @@ class QMIX(nn.Module):
                 act_t = a_i[:, t]  # (B,)
                 a_onehot_t = F.one_hot(act_t, num_classes=self.env.action_space[agent].n).float()  # (B, A)
 
-                q = self.agent_nets[agent](obs_t, a_onehot_t)
+                q, h = self.agent_nets[agent](obs_t, a_onehot_t, h)  # (B, A), (B, hidden_dim)
                 q_selected = q.gather(-1, act_t.unsqueeze(-1)).squeeze(-1)  # (B, T)
                 q_seq.append(q_selected.unsqueeze(1))  # (B, 1)
 
                 with torch.no_grad():
                     next_obs_t = ns_i[:, t]  # (B, obs_dim)
-                    q_target_all = self.target_agent_nets[agent](next_obs_t, a_onehot_t)
+                    q_target_all, h_target = self.target_agent_nets[agent](next_obs_t, a_onehot_t, h_target)  # (B, A), (B, hidden_dim)
                     next_a = q_target_all.argmax(dim=-1, keepdim=True)         # (B, T, 1)
                     q_target = q_target_all.gather(-1, next_a).squeeze(-1)  # (B, T)
                     target_q_seq.append(q_target.unsqueeze(1))  # (B, 1)
@@ -316,7 +315,7 @@ class QMIX(nn.Module):
         tq_total = torch.stack([self.target_mixing_net(target_qs[:, t], next_state[:, t]) for t in range(T)], dim=1)
 
         r_total = reward.sum(dim=2)                   # (B, T)
-        y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=0.8)
+        y_total = td_lambda_target(r_total, tq_total, gamma=self.gamma, td_lambda=1.0)
 
         # Loss
         loss_qmix = F.mse_loss(q_total, y_total.detach())
@@ -337,7 +336,7 @@ class QMIX(nn.Module):
 
         self.epsilon_decay()
         self.step += 1
-        self.update_target()
+        self.update_target(tau=self.tau)
 
         per_agent_qs = agent_qs.detach().mean(dim=(0, 1))
         avg_q_total = q_total.detach().mean().item()
@@ -371,14 +370,15 @@ class QMIX(nn.Module):
             agent: torch.zeros(1, self.env.action_space[agent].n, device=self.device)
             for agent in self.agents
         }
+        hidden_states = {
+            agent: torch.zeros(1, self.agent_nets[agent].hidden_dim, device=self.device)
+            for agent in self.agents
+        }
         
-        for agent in self.agents:
-            self.agent_nets[agent].reset_hidden(batch_size=1, device=self.device)
-            
         for _ in range(self.max_steps):
             actions = {}
             for agent in self.agents:
-                action = self.select_action(agent, obs[agent], last_actions[agent])
+                action, hidden_states[agent] = self.select_action(agent, obs[agent], last_actions[agent], hidden_states[agent])
                 actions[agent] = action
 
             next_obs, rewards, terminations, truncations, infos = env.step(actions)
@@ -419,7 +419,7 @@ class QMIX(nn.Module):
     def train(self, max_episode, log_interval = 1):
         for episode in range(max_episode):
             self.rollout_episode() # returns: {agent_0: [q0, q1, ..., qT], ...}
-            metrics = self.update(alpha=0.1, seq_len=10) # returns: {avg_loss, avg_reward, avg_q_total, per_agent_qs, per_agent_losses}
+            metrics = self.update(alpha=0.2, seq_len=10) # returns: {avg_loss, avg_reward, avg_q_total, per_agent_qs, per_agent_losses}
 
             if not metrics:
                 continue
@@ -455,7 +455,7 @@ class QMIX(nn.Module):
         "agent_nets": {agent: net.state_dict() for agent, net in self.agent_nets.items()},
         "mixing_net": self.mixing_net.state_dict(),
         "optimizer": self.optimizer.state_dict(),
-        "step": self.training_steps,  # 선택적: 현재 학습 단계
+        "step": self.step,  # 선택적: 현재 학습 단계
         "args": {
             "hidden_dims": self.hidden_dims,
             "gamma": self.gamma,

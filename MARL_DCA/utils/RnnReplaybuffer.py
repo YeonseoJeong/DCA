@@ -7,7 +7,7 @@ class ReplayBufferRNN:
     Replay buffer for RNN-based agents in QMIX (GRU 기반).
     Stores full trajectories per episode, and returns fixed-length sequences during training.
     """
-    def __init__(self, capacity=10000, device="cpu"):
+    def __init__(self, capacity, device="cpu"):
         self.buffer = deque(maxlen=capacity)
         self.device = device
 

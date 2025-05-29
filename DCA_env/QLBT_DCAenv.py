@@ -5,7 +5,7 @@ import matplotlib.colors as colors
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from MARL_DCA.env.qmix2 import QMIX, ReplayBufferRNN
+from MARL_DCA.qmix_grucell import QMIX, ReplayBufferRNN
 import torch.nn.functional as F
 import time
 
