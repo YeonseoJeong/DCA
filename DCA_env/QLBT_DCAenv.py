@@ -224,42 +224,85 @@ class QLBT_DCAEnv(gym.Env):
 
         return obs
     
-    def _compute_reward(self):
-        # print("[DEBUG] _compute_reward() 호출됨")
+    # def _compute_reward(self):
+    #     # print("[DEBUG] _compute_reward() 호출됨")
+    #     rewards = {a: 0.0 for a in self.agents}
+    #     ready_nodes = self.hidden_state["ready_nodes"]
+    #     channel = self.hidden_state["channel"]
+    #     d2lt = self.hidden_state["D2LT"]
+    #     self.render_data["time_slot"] += 1
+
+    #     if channel == "ACK":
+    #         winner = self.access_point.current_transmitter # idx
+    #         self.render_data['success'] += 1
+    #         self.render_data['agent_success'][winner] += 1
+    #         self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
+    #         self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
+
+    #         max_d2lt_agent_idx = np.argmax(d2lt)
+
+    #         for i, a in enumerate(self.agents):
+    #             # rewards[a] = (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
+    #             if i == winner:
+    #                 if i == max_d2lt_agent_idx:
+    #                     rewards[a] = 1.0
+    #                 else:
+    #                     rewards[a] = 1.0 * (d2lt[i] / sum(d2lt) + 1e-6)
+                
+    #         self.hidden_state["D2LT"][winner] = 0
+    #         self.hidden_state["others"][winner] = 0
+        
+    #     elif channel == "COLLISION":
+    #         self.render_data['collision'] += 1
+    #         for node in ready_nodes:
+    #             self.render_data['agent_collision'][node] += 1
+    #             rewards[self.agents[node]] = -1.0
+
+    #     return rewards
+
+    def _compute_reward(self, beta=0.3):
         rewards = {a: 0.0 for a in self.agents}
         ready_nodes = self.hidden_state["ready_nodes"]
         channel = self.hidden_state["channel"]
         d2lt = self.hidden_state["D2LT"]
         self.render_data["time_slot"] += 1
 
+        r_total = 0.0
+        total_d2lt = sum(d2lt) + 1e-6
+        jfi = (total_d2lt**2) / (self.num_agents * sum(x**2 for x in d2lt) + 1e-6)
+
         if channel == "ACK":
-            winner = self.access_point.current_transmitter # idx
+            winner = self.access_point.current_transmitter  # index
             self.render_data['success'] += 1
             self.render_data['agent_success'][winner] += 1
             self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
             self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
 
-            max_d2lt_agent_idx = np.argmax(d2lt)
+            max_d2lt_agent_idx = int(np.argmax(d2lt))
+            if winner == max_d2lt_agent_idx:
+                r_total = 1.0
+            else:
+                r_total = d2lt[winner] / total_d2lt
 
-            for i, a in enumerate(self.agents):
-                # rewards[a] = (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
-                if i == winner:
-                    if i == max_d2lt_agent_idx:
-                        rewards[a] = 1.0
-                    else:
-                        rewards[a] = 1.0 * (d2lt[i] / sum(d2lt) + 1e-6)
-                
             self.hidden_state["D2LT"][winner] = 0
             self.hidden_state["others"][winner] = 0
-        
+
         elif channel == "COLLISION":
             self.render_data['collision'] += 1
             for node in ready_nodes:
                 self.render_data['agent_collision'][node] += 1
-                rewards[self.agents[node]] = -1.0
+            r_total = -1.0
+
+        # Jain's Fairness 보상 추가
+        r_total += beta * jfi
+
+        # 모든 agent에게 동일한 공동 보상 부여 (QMIX 구조에 맞게)
+        for a in self.agents:
+            rewards[a] = r_total
 
         return rewards
-    
+
+
     def _initialize_render_data(self):
         self.render_data = {
             "time_agent": np.zeros((self.num_agents, self.RENDER_SLOTS)), # [3, 200]
@@ -380,11 +423,11 @@ class QLBT_DCAEnv(gym.Env):
 
         # (1) 1D 리스트 시계열 키 → 한 줄씩 CSV에 저장
         csv_keys = [
-            "cumsum_success", 
+            # "cumsum_success", 
             "cumsum_success_packet", 
             "cumsum_collision", 
             "delay", 
-            "throughput", 
+            # "throughput", 
             "throughput_packet"
         ]
 
@@ -394,7 +437,7 @@ class QLBT_DCAEnv(gym.Env):
 
             if isinstance(values, list) and len(values) == self.max_cycles:
                 with open(filepath, "a") as f:
-                    line = ",".join(map(str, values))
+                    line = ",".join(f"{v:.2f}" for v in values)
                     f.write(line + "\n")
             else:
                 print(f"[WARN] Skipped {key} for episode {episode}: length = {len(values)}")
@@ -413,8 +456,8 @@ if __name__ == "__main__":
     num_agents = 3
     hidden_dim = 128    # QMIX agent GRU hidden 크기
     action_dim = 2      # 0: wait, 1: transmit
-    max_episodes = 1000
-    max_cycles = 500
+    max_episodes = 500
+    max_cycles = 1000
     packet_length = 10
     render_mode = "rgb_array"
 

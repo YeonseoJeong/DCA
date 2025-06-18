@@ -5,6 +5,10 @@ import torch.optim as optim
 import numpy as np
 import random
 from collections import deque
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))  # 현재 MARL_DCA 폴더
+
 
 import gymnasium as gym
 from pettingzoo.mpe import simple_spread_v3
@@ -382,6 +386,7 @@ class QMIX(nn.Module):
                 actions[agent] = action
 
             next_obs, rewards, terminations, truncations, infos = env.step(actions)
+            # env.render()
 
             next_obs_proc = {
                 agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents
