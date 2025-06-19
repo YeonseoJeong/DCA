@@ -389,7 +389,7 @@ class QMIX(nn.Module):
             joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim() == 2 else obs[agent] for agent in self.agents])
             joint_next_obs = torch.stack([next_obs_proc[agent].squeeze(0) if next_obs_proc[agent].dim() == 2 else next_obs_proc[agent] for agent in self.agents])
             joint_actions = torch.tensor([actions[agent] for agent in self.agents])
-            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents])
+            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents]) ##################### 모든 에이전트가 환경에서 똑같은 보상을 받고있음, r_total 만 받음, agent별로 다르지 않아 독점이 일어나는 것 같음
             joint_dones = torch.tensor([terminations[agent] for agent in self.agents])
 
             episode_data.append((joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
