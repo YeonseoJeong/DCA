@@ -1,17 +1,26 @@
 import gymnasium as gym
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')  # Use 'Agg' backend for rendering without display
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from MARL_DCA.qmix_grucell import QMIX, ReplayBufferRNN
+# from MARL_DCA.qmix_grucell import QMIX
+from MARL_DCA.qlbt_agent import QLBT_Agent
 import torch.nn.functional as F
 import time
 
 if 'ipykernel' in sys.modules:
     from IPython import display
-
+'''
+문제1: exploration이 끝난 뒤 독점 현상이 발생하는 문제 -> individual reward가 없이 모든 agent가 동일한 reward를 받아서 그런것 같음 
+        버퍼에 (joint obs, joint act, joint rew, joint next obs, joint done)로 각기 다른 값으로 들어갈 수 있게 해보기..
+문제2: throughput이 0.7x 이상으로 올라가지 않는 문제 -> 환경이 qmix와 맞지 않아서 생긴 문제같긴 한데, 문제 1을 해결했을때 성능이 어느정도 나아질 지 확인 필요 
+        논문에서도 r_total이랑 r_ind 두개를 사용해서 학습했는데, 지금은 r_total만 사용중
+        POMDP도 수정 필요한지 확인해봐야할듯 
+'''
 
 class AccessPoint: 
     """Access Point for DCA of CSMA/CA, IPPO, QLBT"""
@@ -162,11 +171,7 @@ class QLBT_DCAEnv(gym.Env):
         return obs, infos
 
     def step(self, actions): 
-        # print(f"[DEBUG] step 시작 | t={self.t}, channel={self.hidden_state.get('channel', None)}")
-        # if self.hidden_state["channel"] == "ACK":
-        #     actions = {a: 0 for a in self.agents} # 모든 agent는 대기 상태로 전환
-        #     ready_nodes = []
-        # else: 
+
         action_array = np.array([actions[a] for a in self.agents])
         ready_nodes = np.where(action_array == 1)[0].tolist()
     
@@ -184,7 +189,7 @@ class QLBT_DCAEnv(gym.Env):
         elif channel == "COLLISION": 
             self.hidden_state["successful"] = False 
 
-        rewards = self._compute_reward() 
+        r_indiv, r_total = self._compute_reward() 
         self.access_point.update() 
         self.t += 1
         observations = self._get_obs()
@@ -196,7 +201,7 @@ class QLBT_DCAEnv(gym.Env):
 
         self._update_render_data()
 
-        return observations, rewards, terminations, truncations, infos
+        return observations, (r_indiv, r_total), terminations, truncations, infos
 
     # def get_state(self):
     #     channel_state = self.CHANNEL_STATE_MAP[self.access_point.channel_state]
@@ -223,45 +228,9 @@ class QLBT_DCAEnv(gym.Env):
             }
 
         return obs
-    
-    # def _compute_reward(self):
-    #     # print("[DEBUG] _compute_reward() 호출됨")
-    #     rewards = {a: 0.0 for a in self.agents}
-    #     ready_nodes = self.hidden_state["ready_nodes"]
-    #     channel = self.hidden_state["channel"]
-    #     d2lt = self.hidden_state["D2LT"]
-    #     self.render_data["time_slot"] += 1
 
-    #     if channel == "ACK":
-    #         winner = self.access_point.current_transmitter # idx
-    #         self.render_data['success'] += 1
-    #         self.render_data['agent_success'][winner] += 1
-    #         self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
-    #         self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
-
-    #         max_d2lt_agent_idx = np.argmax(d2lt)
-
-    #         for i, a in enumerate(self.agents):
-    #             # rewards[a] = (self.hidden_state["D2LT"][i] * 10 / self.max_cycles)
-    #             if i == winner:
-    #                 if i == max_d2lt_agent_idx:
-    #                     rewards[a] = 1.0
-    #                 else:
-    #                     rewards[a] = 1.0 * (d2lt[i] / sum(d2lt) + 1e-6)
-                
-    #         self.hidden_state["D2LT"][winner] = 0
-    #         self.hidden_state["others"][winner] = 0
-        
-    #     elif channel == "COLLISION":
-    #         self.render_data['collision'] += 1
-    #         for node in ready_nodes:
-    #             self.render_data['agent_collision'][node] += 1
-    #             rewards[self.agents[node]] = -1.0
-
-    #     return rewards
-
-    def _compute_reward(self, beta=0.3):
-        rewards = {a: 0.0 for a in self.agents}
+    def _compute_reward(self,):
+        r_indiv = {a: 0.0 for a in self.agents}
         ready_nodes = self.hidden_state["ready_nodes"]
         channel = self.hidden_state["channel"]
         d2lt = self.hidden_state["D2LT"]
@@ -269,7 +238,7 @@ class QLBT_DCAEnv(gym.Env):
 
         r_total = 0.0
         total_d2lt = sum(d2lt) + 1e-6
-        jfi = (total_d2lt**2) / (self.num_agents * sum(x**2 for x in d2lt) + 1e-6)
+        max_d2lt_agent_idx = int(np.argmax(d2lt))
 
         if channel == "ACK":
             winner = self.access_point.current_transmitter  # index
@@ -278,11 +247,17 @@ class QLBT_DCAEnv(gym.Env):
             self.render_data['success_packet'] += (self.packet_length + self.access_point.sif)
             self.render_data['agent_success_packet'][winner] += (self.packet_length + self.access_point.sif)
 
-            max_d2lt_agent_idx = int(np.argmax(d2lt))
-            if winner == max_d2lt_agent_idx:
-                r_total = 1.0
-            else:
-                r_total = d2lt[winner] / total_d2lt
+            r_total = 1.0 # 공동 보상
+
+            # 개별 보상
+            for i, a in enumerate(self.agents):
+                if i == winner: 
+                    if winner == max_d2lt_agent_idx:
+                        r_indiv[a] = 1.0
+                    else:
+                        r_indiv[a] = d2lt[i] / total_d2lt
+                else:
+                    r_indiv[a] = 0.0
 
             self.hidden_state["D2LT"][winner] = 0
             self.hidden_state["others"][winner] = 0
@@ -292,15 +267,14 @@ class QLBT_DCAEnv(gym.Env):
             for node in ready_nodes:
                 self.render_data['agent_collision'][node] += 1
             r_total = -1.0
+            for node in ready_nodes:
+                r_indiv[self.agents[node]] = -1.0
 
-        # Jain's Fairness 보상 추가
-        r_total += beta * jfi
+        else:  # channel == "BUSY" or "IDLE"
+            r_total = 0.0
+            r_indiv = {a: 0.0 for a in self.agents}
 
-        # 모든 agent에게 동일한 공동 보상 부여 (QMIX 구조에 맞게)
-        for a in self.agents:
-            rewards[a] = r_total
-
-        return rewards
+        return r_indiv, r_total
 
 
     def _initialize_render_data(self):
@@ -442,22 +416,14 @@ class QLBT_DCAEnv(gym.Env):
             else:
                 print(f"[WARN] Skipped {key} for episode {episode}: length = {len(values)}")
 
-
-# def obs_dict_to_vec(obs_dict):
-#     return np.concatenate((
-#         [obs_dict["channel_state"]],
-#         [obs_dict["collision"]],
-#         obs_dict["own_d2lt"]
-#     )).astype(np.float32)
-
     
 if __name__ == "__main__":
 
     num_agents = 3
     hidden_dim = 128    # QMIX agent GRU hidden 크기
     action_dim = 2      # 0: wait, 1: transmit
-    max_episodes = 500
-    max_cycles = 1000
+    max_episodes = 1000
+    max_cycles = 500
     packet_length = 10
     render_mode = "rgb_array"
 
@@ -468,69 +434,12 @@ if __name__ == "__main__":
         render_mode = render_mode
     )
 
-
-    trainer = QMIX(env=env, hidden_dims=hidden_dim, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-        epochs=10, max_steps=max_cycles, log_dir="logs/qmix_dca_logs", plot_window=100,
-        update_interval=100, device="cpu", tau=0.01, decay_ratio = 0.99
+    trainer = QLBT_Agent(env=env, hidden_dims=hidden_dim, batch_size=32, buffer_capacity=10000, lr=1e-4, gamma=0.95,
+        epochs=max_episodes, max_steps=max_cycles, log_dir="logs/qlbt_dca_logs", plot_window=100, update_interval=100,
+        decay_rate = 0.005, decay_type="exponential"
     )
 
-    trainer.buffer = ReplayBufferRNN(capacity=10000, device="cpu")
-
-    trainer.train(max_episode=max_episodes)
+    trainer.train()
 
     if not env.NOTEBOOK:
         plt.show()
-
-
-#     def evaluate_qmix(env, trainer, episodes=5, episode_index=None):
-#         total_reward = 0
-#         eval_log = []
-#         for ep in range(episodes):
-#             obs_dict, _ = env.reset()
-#             obs = {agent: trainer.preprocess_observation(obs_dict[agent], agent) for agent in env.agents}
-#             h_states = {agent: torch.zeros(hidden_dim) for agent in env.agents}
-#             last_actions = {agent: torch.zeros(action_dim) for agent in env.agents}
-#             episode_reward = 0
-
-#             for _ in range(max_cycles):
-#                 actions, h_next = {}, {}
-#                 for agent in env.agents:
-#                     action, h_new = trainer.select_action(
-#                         agent=agent,
-#                         obs=obs[agent],
-#                         last_action=last_actions[agent],
-#                         his_in=h_states[agent],
-#                         epsilon=0.0
-#                     )
-#                     actions[agent] = action
-#                     h_next[agent] = h_new.detach()
-
-#                 obs_next_dict, rewards, terminations, truncations, _ = env.step(actions)
-#                 env.render()
-#                 episode_reward += sum(rewards.values())
-#                 obs = {agent: trainer.preprocess_observation(obs_next_dict[agent], agent) for agent in env.agents}
-#                 h_states = h_next
-#                 last_actions = {
-#                     agent: F.one_hot(torch.tensor(actions[agent]), num_classes=action_dim).float() for agent in env.agents
-#                 }                
-#                 if all(terminations.values()) or all(truncations.values()):
-#                     break
-
-#             print(f"[EVAL] Episode {ep+1}: Total reward = {episode_reward:.2f}")
-#             eval_log.append(episode_reward)
-#             total_reward += episode_reward
-
-#         avg_reward = total_reward / episodes
-#         print(f"[EVAL] Average reward over {episodes} episodes: {avg_reward:.2f}")
-
-
-
-#         trainer.train()
-#         print(f"Episode {episode + 1}/{max_episodes} finished. Total reward: {sum([r.item() for r in r_seq]):.3f}, Steps: {len(r_seq)}")
-#         env.save_render_data(env, save_dir="logs/render_data", episode=episode)
-
-#         if (episode + 1) % 100 == 0:
-#             trainer.save(f"checkpoints/qmix_ep{episode+1}.pth")
-#             evaluate_qmix(env, trainer, episodes=5, episode_index=episode+1)
-
-#     plt.show()

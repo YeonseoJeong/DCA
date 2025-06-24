@@ -3,131 +3,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import math
 import random
 import time
 import sys
 import os
 sys.path.append(os.path.dirname(__file__))  # 현재 MARL_DCA 폴더
-
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import gymnasium as gym
 import wandb
 from pettingzoo.mpe import simple_spread_v3
-from pettingzoo.utils.conversions import aec_to_parallel
 from utils.logger import Logger
 from utils.RnnReplaybuffer import ReplayBufferRNN
+from RL_algorithm.QLBT import AgentNetwork, MixingNetwork
 
 '''
-QMIX
-Lqmix: E(Sigma i=1^bs)[(yi_tot - Qi_tot(τ, u, s; θ))^2] 
-yi_tot = r +γ maxu′ Qtot(τ ′, u′, s′; θ−)
-Qtot(τ, u, s; θ) = f(Q1(τ1, u1, s; θ), Q2(τ2, u2, s; θ), ..., Qn(τn, un, s; θ); s)
-f: mixing network
+문제: total reward가 모든 에이전트에게 동일하게 적용됨
+해결: 각 에이전트별로 reward를 다르게 적용하는 방법을 찾아야 함 -> 성능 확인
+
+1) r_i = α * r_total + (1 - α) * r_indiv[i](agent i의 D2LT 또는 전송 성공률)
+2) r_i = r_total − r_total^(−i)(에이전트 i를 제외한 결과) -> 나를 제외한 나머지의 보상을 자신의 보상으로 사용
+3) QPLEX = 개별 Q를 분리해서 advantage_i = Q_total - baseline_i 형태로 학습
+4) JAIN INDEX = 각 에이전트의 reward 또는 throughput 벡터 x = [x₁, x₂, ..., xₙ]에 대해
+Jain(x)=(∑x_i)² / (n * ∑x_i²) 값을 joint reward에 곱해서 사용
+
 '''
-
-# 추가한 부분
-# QMIX - agent net에 Q_indiv를 추가하여, 각 에이전트의 Q값을 개별적으로 계산하고 joint 해서 Mixing Network에 전달
-
-class AgentNetwork(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=64):
-        super(AgentNetwork, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)  # 히스토리 저장
-        self.q_out = nn.Linear(hidden_dim, action_dim)
-
-    def forward(self, obs, last_action, his_in):
-        x = torch.cat([obs, last_action], dim=-1)
-        x = F.relu(self.fc1(x))
-        if his_in is None:
-            his_in = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
-        else:
-            try:
-                his_in = his_in.reshape(x.size(0), self.hidden_dim)
-            except Exception as e:
-                raise ValueError(f"Invalid hidden state shape: {his_in.shape}") from e
-
-        his_out = self.gru(x, his_in) 
-        q_ind = self.q_out(his_out)
-        return q_ind, his_out
-
-
-class HyperNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(HyperNetwork, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU()
-        )
-    def forward(self, state):
-        return torch.abs(self.fc(state))
-
-
-class MixingNetwork(nn.Module):
-    def __init__(self, n_agents, state_dim, hidden_dim=64):
-        super(MixingNetwork, self).__init__()
-        self.n_agents = n_agents
-        self.hidden_dim = hidden_dim
-        self.state_dim = state_dim
-
-        self.hyper_w1 = HyperNetwork(state_dim, n_agents * hidden_dim)
-        self.hyper_b1 = nn.Linear(state_dim, hidden_dim)
-
-        # For joint Q_indiv (vectorized)
-        self.hyper_w2_ind = HyperNetwork(state_dim, hidden_dim * n_agents)
-        self.hyper_b2_ind = nn.Linear(state_dim, n_agents)
-
-        # For Q_total (scalar)
-        self.hyper_w2_tot = HyperNetwork(state_dim, hidden_dim)
-        self.hyper_b2_tot = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, q_indiv, state): 
-        # q_indiv : (batch, n_agents)
-        # state : (batch, state_dim) = obs_dim * n_agents
-
-        q_indiv = q_indiv.unsqueeze(0) if q_indiv.dim() == 1 else q_indiv       # [B, n_agents]
-        state = state.unsqueeze(0) if state.dim() == 1 else state               # [B, state_dim]
-
-        # First Layer
-        w1 = self.hyper_w1(state).view(-1, self.n_agents, self.hidden_dim)      # W1 = [B, n_agents, hidden_dim]
-        b1 = self.hyper_b1(state).view(-1, 1, self.hidden_dim)                  # b1 = [B, 1, hidden_dim]
-        hidden = F.elu(torch.bmm(q_indiv.unsqueeze(1), w1) + b1)                # hidden = [B, 1, hidden_dim]        
-
-        # ---- Q_joint_indiv (vector output) ----
-        w2_ind = self.hyper_w2_ind(state).view(-1, self.hidden_dim, self.n_agents)      # W2_ind = [B, hidden_dim, n_agents]
-        b2_ind = self.hyper_b2_ind(state).view(-1, 1, self.n_agents)                    # b2_ind = [B, 1, n_agents]
-        joint_q_ind = torch.bmm(hidden, w2_ind) + b2_ind                        # joint_q_ind = [B, 1, n_agents]
-        joint_q_ind = joint_q_ind.squeeze(1)                                    # joint_q_ind = [B, n_agents]
-        
-        # ---- Q_total (scalar output) ----
-        w2_tot = self.hyper_w2_tot(state).view(-1, self.hidden_dim, 1)              # W2_tot = [B, hidden_dim, 1]
-        b2_tot = self.hyper_b2_tot(state)                                           # b2_tot = [B, 1]    
-        q_total = torch.bmm(hidden, w2_tot).squeeze(1) + b2_tot                     # q_total = [B, 1]
-
-        return joint_q_ind, q_total
-
-
 class QLBT_Agent(nn.Module):
     def __init__(self,
                 env,
                 hidden_dims, 
-                batch_size = 64, 
+                batch_size = 32, 
                 buffer_capacity = 10000, 
-                lr = 0.0003,
+                lr = 1e-4,
                 gamma=0.95, 
                 epochs = 10,
                 max_steps = 200,
                 log_dir = "logs/qlbt_logs",
                 plot_window = 100,
-                clip_grad = 10.0,
-                update_interval=100, 
+                clip_grad = 5.0,
+                update_interval=20, 
                 device = "cpu",
-                tau = 0.01,
-                decay_ratio = 0.99
+                tau = 0.001,
+                decay_rate=0.001,
+                decay_type='exponential'  # or 'linear'
                 ):
         super(QLBT_Agent, self).__init__()
         
@@ -148,7 +66,7 @@ class QLBT_Agent(nn.Module):
         # Initialize agent networks and target networks
         for agent in self.agents:
             # obs_space = env.observation_space[agent]
-            obs_space = env.observation_space(agent)
+            obs_space = env.observation_space[agent]
             
             if isinstance(obs_space, gym.spaces.Dict):
                 obs_dim = sum(space.n if isinstance(space, gym.spaces.Discrete) else space.shape[0] for space in obs_space.spaces.values())
@@ -156,19 +74,19 @@ class QLBT_Agent(nn.Module):
                 obs_dim = obs_space.n if isinstance(obs_space, gym.spaces.Discrete) else obs_space.shape[0]
             
             # act_dim = self.env.action_space[agent].n
-            self.act_dim = self.env.action_space(agent).n
+            self.act_dim = self.env.action_space[agent].n
             self.agent_nets[agent] = AgentNetwork(obs_dim, self.act_dim, hidden_dims).to(self.device)
             self.target_agent_nets[agent] = AgentNetwork(obs_dim, self.act_dim, hidden_dims).to(self.device)
             self.obs_spaces[agent] = obs_space
         
         ''' agent_nets의 네트워크 파라미터도 optimizer에 포함시켜야 함'''
-        agent_params = []
+        self.agent_params = []
         for agent in self.agent_nets.values():
-            agent_params += list(agent.parameters())
+            self.agent_params += list(agent.parameters())
 
         self.mixing_net = MixingNetwork(self.n_agents, obs_dim * self.n_agents, hidden_dims).to(self.device)
         self.target_mixing_net = MixingNetwork(self.n_agents, obs_dim * self.n_agents, hidden_dims).to(self.device)
-        self.optimizer = optim.Adam(agent_params+list(self.mixing_net.parameters()), lr=lr,amsgrad=True)
+        self.optimizer = optim.Adam(self.agent_params+list(self.mixing_net.parameters()), lr=lr,amsgrad=True)
 
         self.batch_size = batch_size # B
         self.gamma = gamma
@@ -177,8 +95,10 @@ class QLBT_Agent(nn.Module):
         self.max_steps = max_steps
         self.clip_grad = clip_grad
         self.epsilon_start = 1.0
-        self.epsilon_end = 0.1
-        self.decay_ratio = decay_ratio
+        self.epsilon_end = 0.05
+        self.epsilon = self.epsilon_start
+        self.decay_rate = decay_rate
+        self.decay_type = decay_type  # 'exponential' or 'linear'
         self.step = 0
         self.tau = tau
         self.logger = Logger(log_dir, self.log_prefix, plot_window)
@@ -220,26 +140,37 @@ class QLBT_Agent(nn.Module):
             for target_param, param in zip(self.target_mixing_net.parameters(), self.mixing_net.parameters()):
                 target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-    '''너무 단순하게 감소하는 경향이 있음'''
     def epsilon_decay(self):
-        self.epsilon_start = max(self.epsilon_end, self.epsilon_start * self.decay_ratio)
-        return self.epsilon_start 
+        if self.decay_type == 'linear':
+            self.epsilon = max(self.epsilon_end, self.epsilon_start - self.decay_rate * self.step)
+        else:  # exponential
+            self.epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * math.exp(-self.decay_rate * self.step)
+        self.step += 1
+        return self.epsilon
     
 
     def td_target(self, rewards, target_qs, done_mask, gamma):
-        if rewards.dim() > 2:
-            rewards = rewards.squeeze(-1)
-        if target_qs.dim() > 2:
-            target_qs = target_qs.squeeze(-1)
-        if done_mask.dim() > 2:
-            done_mask = done_mask.squeeze(-1)
+        # print(f"[TD_TARGET] rewards shape: {rewards.shape}, target_qs shape: {target_qs.shape}, done_mask shape: {done_mask.shape}")
+        # Expand done_mask to match (B, T, N) if needed
+        if rewards.dim() == 3 and done_mask.dim() == 2:
+            done_mask = done_mask.unsqueeze(-1).expand(-1, -1, rewards.shape[2])
 
-        B, T = rewards.shape
-        targets = torch.zeros_like(rewards).to(rewards.device)
-        targets[:, -1] = rewards[:, -1]  # Last Q-value
+        if rewards.dim() == 2:
+            B, T = rewards.shape
+            targets = torch.zeros_like(rewards).to(rewards.device)
+            targets[:, -1] = rewards[:, -1]  # Last Q-value
+            
+            for t in reversed(range(T - 1)):
+                targets[:, t] = rewards[:, t] + gamma * target_qs[:, t + 1] * (1.0 - done_mask[:, t + 1])
+        elif rewards.dim() == 3:
+            B, T, N = rewards.shape
+            targets = torch.zeros_like(rewards).to(rewards.device)
+            targets[:, -1, :] = rewards[:, -1, :]
+            for t in reversed(range(T - 1)):
+                targets[:, t, :] = rewards[:, t, :] + gamma * target_qs[:, t + 1, :] * (1.0 - done_mask[:, t + 1, :])
+        else:
+            raise ValueError(f"Unexpected rewards shape: {rewards.shape}")
         
-        for t in reversed(range(T - 1)):
-            targets[:, t] = rewards[:, t] + gamma * target_qs[:, t + 1] * (1.0 - done_mask[:, t + 1])
         return targets
 
 
@@ -254,7 +185,7 @@ class QLBT_Agent(nn.Module):
         q_values, h_out = self.agent_nets[agent](obs_tensor, last_action_tensor, h_in)
         q_values = q_values.squeeze(0) if q_values.dim() > 1 and q_values.size(0) == 1 else q_values
             
-        if random.random() < self.epsilon_start: # exploration
+        if random.random() < self.epsilon: # exploration
             action = random.randint(0, self.act_dim - 1)
         else: # exploitation
             action = q_values.argmax().item()
@@ -283,8 +214,8 @@ class QLBT_Agent(nn.Module):
                 action, hidden_states[agent] = self.select_action(agent, obs[agent], last_actions[agent], hidden_states[agent])
                 actions[agent] = action
 
-            next_obs, rewards, terminations, truncations, infos = env.step(actions)
-            # env.render()
+            next_obs, (r_indiv, r_total), terminations, truncations, infos = env.step(actions)
+            env.render()
 
             next_obs_proc = {
                 agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents
@@ -292,10 +223,13 @@ class QLBT_Agent(nn.Module):
             joint_obs = torch.stack([obs[agent].squeeze(0) if obs[agent].dim() == 2 else obs[agent] for agent in self.agents])
             joint_next_obs = torch.stack([next_obs_proc[agent].squeeze(0) if next_obs_proc[agent].dim() == 2 else next_obs_proc[agent] for agent in self.agents])
             joint_actions = torch.tensor([actions[agent] for agent in self.agents])
-            joint_rewards = torch.tensor([rewards[agent] for agent in self.agents])
+            
+            # rewards = individual rewards + joint reward
+            joint_rewards_indiv = torch.tensor([r_indiv[agent] for agent in self.agents])
+            joint_rewards_total = torch.tensor(r_total, dtype=torch.float32)
             joint_dones = torch.tensor([terminations[agent] or truncations[agent] for agent in self.agents])
 
-            episode_data.append((joint_obs, joint_actions, joint_rewards, joint_next_obs, joint_dones))
+            episode_data.append((joint_obs, joint_actions, joint_rewards_indiv, joint_rewards_total, joint_next_obs, joint_dones))
             obs = next_obs_proc
             last_actions = {
                 agent: F.one_hot(torch.tensor(actions[agent]), num_classes=self.act_dim).float().to(self.device)
@@ -305,20 +239,21 @@ class QLBT_Agent(nn.Module):
             if all(terminations.values()) or all(truncations.values()):
                 break
 
-        s_seq, a_seq, r_seq, ns_seq, d_seq = zip(*episode_data)
+        s_seq, a_seq, r_indiv_seq, r_total_seq, ns_seq, d_seq = zip(*episode_data)
         self.buffer.push(
             state_seq=torch.stack(s_seq),
             action_seq=torch.stack(a_seq),
-            reward_seq=torch.stack(r_seq),
+            r_indiv_seq=torch.stack(r_indiv_seq),
+            r_total_seq=torch.stack(r_total_seq),
             next_state_seq=torch.stack(ns_seq),
             done_seq=torch.stack(d_seq)
         )
 
-    def update(self, alpha=0.2, seq_len=10):
+    def update(self, alpha=0.3, seq_len=10): # Mixing Net, Agent Net 업데이트 
         if len(self.buffer) < self.batch_size:
-            return 0.0
+            return None
 
-        state, action, reward, next_state, done = self.buffer.sample(self.batch_size, seq_len)
+        state, action, r_indiv, r_total, next_state, done = self.buffer.sample(self.batch_size, seq_len)
         B, T, N, obs_dim = state.shape
         agent_qs, target_qs = [], []
 
@@ -326,7 +261,6 @@ class QLBT_Agent(nn.Module):
             action_i = action[:, :, i]                      # action_i = (B, T)
             obs_i = state[:, :, i, :]                       # obs_i = (B, T, obs)
             nextobs_i = next_state[:, :, i, :]              # nextobs_i = (B, T, obs)
-
             h, h_target = None, None
             q_seq, target_q_seq = [], []
 
@@ -346,8 +280,8 @@ class QLBT_Agent(nn.Module):
                     q_target = q_target_all.gather(-1, next_a).squeeze(-1)  # (B, T)
                     target_q_seq.append(q_target.unsqueeze(1))  # (B, 1)
 
-            agent_qs.append(torch.cat(q_seq, dim =1))           
-            target_qs.append(torch.cat(target_q_seq, dim =1))   
+            agent_qs.append(torch.cat(q_seq, dim =1))
+            target_qs.append(torch.cat(target_q_seq, dim =1))
 
         agent_qs = torch.stack(agent_qs, dim=-1)     # (B, T, N)
         target_qs = torch.stack(target_qs, dim=-1)   # (B, T, N)
@@ -356,61 +290,63 @@ class QLBT_Agent(nn.Module):
         next_state = next_state.view(B, T, -1)
 
         # Mixing Network
-        joint_q_ind_list, q_total_list = [], []
-        target_q_ind_list, tq_total_list = [], []
+        q_indiv_list, q_total_list = [], []
+        tq_indiv_list, tq_total_list = [], []
         for t in range(T):
-            joint_q_t, q_total_t = self.mixing_net(agent_qs[:, t], state[:, t])
-            joint_q_ind_list.append(joint_q_t.unsqueeze(1))  # (B, 1, N)
-            q_total_list.append(q_total_t.unsqueeze(1))          # (B, 1)
+            q_indiv, q_total = self.mixing_net(agent_qs[:, t], state[:, t])
+            q_indiv_list.append(q_indiv.unsqueeze(1))  # (B, 1, N)
+            q_total_list.append(q_total.unsqueeze(1))          # (B, 1)
 
             with torch.no_grad():
-                tq_ind_t, tq_total_t = self.target_mixing_net(target_qs[:, t], next_state[:, t])
-                target_q_ind_list.append(tq_ind_t.unsqueeze(1))
-                tq_total_list.append(tq_total_t.unsqueeze(1))
+                tq_indiv, tq_total = self.target_mixing_net(target_qs[:, t], next_state[:, t])
+                tq_indiv_list.append(tq_indiv.unsqueeze(1))
+                tq_total_list.append(tq_total.unsqueeze(1))
         
-        joint_q_ind = torch.cat(joint_q_ind_list, dim=1)  # (B, T, N)
+        q_ind = torch.cat(q_indiv_list, dim=1)  # (B, T, N)
         q_total = torch.cat(q_total_list, dim=1).squeeze(-1)           # (B, T)
-        target_joint_q_ind = torch.cat(target_q_ind_list, dim=1)  # (B, T, N)
+        tq_ind = torch.cat(tq_indiv_list, dim=1)  # (B, T, N)
         tq_total = torch.cat(tq_total_list, dim=1).squeeze(-1)            # (B, T)
 
 
-        r_total = reward.sum(dim=2)                     # (B, T)
+        # r_total = reward.sum(dim=2)                     # (B, T)
         done_mask = done.any(dim=2).float()             # (B, T)
         y_total = self.td_target(r_total, tq_total, done_mask, self.gamma)
+        y_indiv = self.td_target(r_indiv, tq_ind, done_mask, self.gamma)
 
         # Loss
         loss_qmix = F.mse_loss(q_total, y_total.detach())
-        loss_ind = F.mse_loss(joint_q_ind, target_joint_q_ind.detach())
+        loss_ind = F.mse_loss(q_ind, y_indiv.detach())
         loss = loss_qmix + alpha * loss_ind
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
-            nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.clip_grad)
+            nn.utils.clip_grad_norm_(self.agent_params + list(self.mixing_net.parameters()), max_norm=5.0)
         self.optimizer.step()
 
         self.epsilon_decay()
-        self.step += 1
-        self.update_target(tau=self.tau)
+        if self.step % self.update_interval == 0:
+            self.update_target(tau=None)
 
         per_agent_qs = agent_qs.detach().mean(dim=(0, 1))
         avg_q_total = q_total.detach().mean().item()
+        avg_reward = (1-alpha) * r_total.mean().item() + alpha * r_indiv.mean().item()  
         td_errors = (agent_qs - target_qs.detach()) ** 2
         per_agent_losses = td_errors.mean(dim=(0, 1))
 
         metrics = {
             'avg_loss': loss.item(),
-            'avg_reward': r_total.mean().item(),
+            'avg_reward': avg_reward, # avg_reward: (B + T + N) / r_total (B + T) => 배치랑 타임스텝으로 평균낸 agent리워드 합산한 값
             'avg_q_total': avg_q_total,
-            'avg_entropy': self.epsilon_decay(),
+            'avg_entropy': self.epsilon,
             'per_agent_qs': {agent: per_agent_qs[i].item() for i, agent in enumerate(self.agents)},
             'per_agent_losses': {agent: per_agent_losses[i].item() for i, agent in enumerate(self.agents)}
         }
         return metrics
     
 
-    def train(self, log_interval=1):
+    def train(self, update_per_episode = 3, log_interval=1):
         wandb.init(
-            project="QLBT",      
+            project="QLBT_DCA",      
             name=f"run_{int(time.time())}",  
             config={
                 "alpha": 0.2,
@@ -421,10 +357,13 @@ class QLBT_Agent(nn.Module):
         )
         for episode in range(self.epochs):
             self.rollout_episode()
-            metrics = self.update(alpha=0.2, seq_len=10) 
-            if not metrics:
-                continue
 
+            for _ in range(update_per_episode):
+                metrics = self.update(alpha=0.2, seq_len=10) # 한 에피소드 내에서도 여러번 업데이트가 이루어지기 때문에 로그에 노이즈처럼 찍힘
+
+            if metrics is None:
+                continue
+            
             # Log overall metrics
             log_data = {
                 'avg_reward': metrics['avg_reward'],
@@ -438,14 +377,16 @@ class QLBT_Agent(nn.Module):
                 log_data[f'{agent}_loss'] = metrics['per_agent_losses'][agent]
             
             # self.logger.log_metrics(log_data, episode)
-            wandb.log(log_data, step=episode)
+            #     if episode % log_interval == 0:
+            #         self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}") 
+        
+            if episode % log_interval == 0:
+                wandb.log(log_data, step=episode)
             try:
                 self.env.save_render_data(save_dir="logs/render_data", episode=episode)
             except Exception as e:
                 print(f"[ERROR] save_render_data failed at episode {episode}: {e}")
 
-        #     if episode % log_interval == 0:
-        #         self.logger.info(f"Episode {episode} | Avg Reward: {metrics['avg_reward']:.4f} | Avg Q total: {metrics['avg_q_total']:.4f} | Avg Loss: {metrics['avg_loss']:.4f} | Avg Entropy: {metrics['avg_entropy']:.4f}") 
         # self.logger.close()       
 
 
@@ -478,14 +419,11 @@ class QLBT_Agent(nn.Module):
         print(f"[LOAD] Model loaded from {path}")
 
 
-if __name__ == '__main__':
-    env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 200, continuous_actions=False)
-    # env = aec_to_parallel(env)
-    hidden_dims = 128
+# if __name__ == '__main__':
+#     env = simple_spread_v3.parallel_env(render_mode = 'None', N=3, max_cycles = 25, continuous_actions=False)
+#     # env = aec_to_parallel(env)
+#     hidden_dims = 128
 
-    qmix = QLBT_Agent(env=env, hidden_dims=hidden_dims, batch_size=64, buffer_capacity=10000, lr=0.0003, gamma=0.95,
-                epochs=1000, max_steps=500, log_dir="logs/simple_spread_logs", plot_window=100,
-                update_interval=100, device="cpu", tau=0.01)
-
-    qmix.train()
+#     qmix = QLBT_Agent(env=env, hidden_dims=hidden_dims, epochs=1000, max_steps=25, log_dir="logs/simple_spread_logs")
+#     qmix.train()
     
