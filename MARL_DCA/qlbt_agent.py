@@ -215,7 +215,7 @@ class QLBT_Agent(nn.Module):
                 actions[agent] = action
 
             next_obs, (r_indiv, r_total), terminations, truncations, infos = env.step(actions)
-            env.render()
+            # env.render()
 
             next_obs_proc = {
                 agent: self.preprocess_observation(next_obs[agent], agent) for agent in self.agents
@@ -227,6 +227,7 @@ class QLBT_Agent(nn.Module):
             # rewards = individual rewards + joint reward
             joint_rewards_indiv = torch.tensor([r_indiv[agent] for agent in self.agents])
             joint_rewards_total = torch.tensor(r_total, dtype=torch.float32)
+
             joint_dones = torch.tensor([terminations[agent] or truncations[agent] for agent in self.agents])
 
             episode_data.append((joint_obs, joint_actions, joint_rewards_indiv, joint_rewards_total, joint_next_obs, joint_dones))
@@ -327,7 +328,7 @@ class QLBT_Agent(nn.Module):
         if self.step % self.update_interval == 0:
             self.update_target(tau=None)
 
-        per_agent_qs = agent_qs.detach().mean(dim=(0, 1))
+        per_agent_qs = q_ind.detach().mean(dim=(0, 1))
         avg_q_total = q_total.detach().mean().item()
         avg_reward = (1-alpha) * r_total.mean().item() + alpha * r_indiv.mean().item()  
         td_errors = (agent_qs - target_qs.detach()) ** 2

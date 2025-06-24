@@ -1,7 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')  # Use 'Agg' backend for rendering without display
+matplotlib.use('Qt5Agg')  # Use 'Agg' backend for rendering without display
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import sys
@@ -252,12 +252,9 @@ class QLBT_DCAEnv(gym.Env):
             # 개별 보상
             for i, a in enumerate(self.agents):
                 if i == winner: 
-                    if winner == max_d2lt_agent_idx:
-                        r_indiv[a] = 1.0
-                    else:
-                        r_indiv[a] = d2lt[i] / total_d2lt
+                    r_indiv[a] = 1.0      # 딜레이가 너무 높음 throughput은 향상됨                 
                 else:
-                    r_indiv[a] = 0.0
+                    r_indiv[a] = d2lt[i] / total_d2lt
 
             self.hidden_state["D2LT"][winner] = 0
             self.hidden_state["others"][winner] = 0
@@ -266,13 +263,14 @@ class QLBT_DCAEnv(gym.Env):
             self.render_data['collision'] += 1
             for node in ready_nodes:
                 self.render_data['agent_collision'][node] += 1
-            r_total = -1.0
+            r_total = -0.5
             for node in ready_nodes:
-                r_indiv[self.agents[node]] = -1.0
+                r_indiv[self.agents[node]] = -0.5
 
-        else:  # channel == "BUSY" or "IDLE"
-            r_total = 0.0
-            r_indiv = {a: 0.0 for a in self.agents}
+        elif channel == "IDLE": # 전송 회피 방지
+            r_total = -0.2
+            for a in self.agents:
+                r_indiv[a] = -0.2
 
         return r_indiv, r_total
 
@@ -434,6 +432,7 @@ if __name__ == "__main__":
         render_mode = render_mode
     )
 
+
     trainer = QLBT_Agent(env=env, hidden_dims=hidden_dim, batch_size=32, buffer_capacity=10000, lr=1e-4, gamma=0.95,
         epochs=max_episodes, max_steps=max_cycles, log_dir="logs/qlbt_dca_logs", plot_window=100, update_interval=100,
         decay_rate = 0.005, decay_type="exponential"
@@ -441,5 +440,5 @@ if __name__ == "__main__":
 
     trainer.train()
 
-    if not env.NOTEBOOK:
-        plt.show()
+    # if not env.NOTEBOOK:
+    #     plt.show()
